@@ -3,6 +3,7 @@ import gc
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -69,7 +70,8 @@ from moviepy import VideoFileClip
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .analysis import MultimodalAnalyzer
-from .config import CLIPS_DIR, FFMPEG_EXE, FONT_SETTINGS, MODELS_DIR, TRANSCRIPT_CACHE_DIR, WORK_DIR
+from .config import (BACKGROUND_FOOTAGE_DIR, CLIPS_DIR, FFMPEG_EXE, FONT_SETTINGS,
+                     MODELS_DIR, TRANSCRIPT_CACHE_DIR, WORK_DIR)
 from .emotion import EmotionDetector
 from .face_crop import SmartFaceCrop
 from .hooks import HookOverlay
@@ -93,7 +95,8 @@ class ProcessingThread(QThread):
     def __init__(self, url, quality, language, clip_duration,
                  zoom_enabled, zoom_intensity,
                  face_crop_enabled=True, hook_enabled=True, virality_enabled=True,
-                 multi_speaker_crop=False, clip_count=7, index_offset=0):
+                 multi_speaker_crop=False, clip_count=7, index_offset=0,
+                 centered_layout_enabled=False, split_screen_enabled=False):
         super().__init__()
         self.url               = url
         self.quality           = quality
@@ -116,6 +119,13 @@ class ProcessingThread(QThread):
         # клипы разных исходников не смешивались в одной общей папке.
         self.clip_subdir        = None
         self.sponsor_segments   = []
+        # Альтернативный формат вывода: исходник вписывается в кадр целиком (без
+        # кропа/зума/фокуса на лицах) и центрируется, с заголовком сверху — вместо
+        # обычного full-bleed кропа с умным слежением за лицом.
+        self.centered_layout_enabled = centered_layout_enabled
+        # Split-screen: исходник в верхней половине, фоновая "нарезка"
+        # (Subway Surfers/песок/т.п. из BACKGROUND_FOOTAGE_DIR) — в нижней.
+        self.split_screen_enabled    = split_screen_enabled
         # Заголовки, уже сгенерированные в этом прогоне — подсказываем модели
         # их не повторять, иначе все клипы одного видео скатываются в один шаблон.
         self._generated_titles  = []
@@ -907,6 +917,41 @@ class ProcessingThread(QThread):
         scale = max(target_w * margin / clip.w, target_h * margin / clip.h)
         return clip.resized(scale)
 
+    @classmethod
+    def _crop_to_fill(cls, clip, target_w, target_h, margin=1.5):
+        resized = cls._resize_to_cover(clip, target_w, target_h, margin=margin)
+        return resized.cropped(x_center=resized.w / 2, y_center=resized.h / 2,
+                               width=target_w, height=target_h)
+
+    def _pick_background_clip(self, duration):
+        """Случайный ролик из BACKGROUND_FOOTAGE_DIR (Subway Surfers/песок/т.п. —
+        пользователь сам кладёт файлы в эту папку), обрезанный/зациклённый под
+        нужную длительность. None, если папка пуста — вызывающий код сам решает,
+        что делать (лог + fallback)."""
+        exts = ('.mp4', '.mov', '.mkv', '.webm')
+        try:
+            files = [f for f in os.listdir(BACKGROUND_FOOTAGE_DIR) if f.lower().endswith(exts)]
+        except Exception:
+            files = []
+        if not files:
+            return None
+        path = os.path.join(BACKGROUND_FOOTAGE_DIR, random.choice(files))
+        try:
+            bg = VideoFileClip(path).without_audio()
+        except Exception as e:
+            self.log.emit(f"⚠️ Не смог открыть фоновое видео {path}: {e}")
+            return None
+        if bg.duration >= duration:
+            start = random.uniform(0, bg.duration - duration)
+            return bg.subclipped(start, start + duration)
+        # Исходник короче нужной длины — зацикливаем.
+        from moviepy import concatenate_videoclips
+        loops, total = [], 0.0
+        while total < duration:
+            loops.append(bg.subclipped(0, bg.duration))
+            total += bg.duration
+        return concatenate_videoclips(loops).subclipped(0, duration)
+
     @staticmethod
     def _make_video_folder(title: str) -> str:
         """clips/<название видео>/ — своя папка на каждый обработанный видео-исходник,
@@ -935,40 +980,79 @@ class ProcessingThread(QThread):
         try:
             clip = VideoFileClip(input_path).subclipped(start, end)
             w_out, h_out = 1080, 1920
-            # Если зум включён, кадрируем с запасом ZOOM_CANVAS_MARGIN и отдаём этот запас
-            # под зум на этапе apply_dynamic_zoom — так зум всегда получается уменьшением
-            # (downscale), а не апскейлом уже финального кадра, откуда раньше бралось размытие.
-            zoom_margin = self.ZOOM_CANVAS_MARGIN if self.zoom_enabled else 1.0
-            crop_w, crop_h = int(w_out * zoom_margin), int(h_out * zoom_margin)
 
-            # ── Crop ──────────────────────────────────────────
-            # Один проход ресайза (вместо двух последовательных width→height) —
-            # каждый лишний проход интерполяции размывает картинку.
-            if self.face_crop_enabled:
-                self.log.emit("👤 Умный кроп...")
-                try:
-                    resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.6)
-                    clip = SmartFaceCrop(crop_w, crop_h, smoothing=0.97, max_step=8,
-                                        multi_speaker=self.multi_speaker_crop).make_transform(resized)
-                    self.log.emit("✅ Face crop!")
-                except Exception as e:
-                    self.log.emit(f"⚠️ Face crop: {e} → стандартный кроп")
+            if self.centered_layout_enabled:
+                # Альтернативный формат: без кропа/зума/фокуса на лицах — исходник
+                # целиком вписывается в кадр (contain-fit) и центрируется на чёрном
+                # холсте, заголовок держится сверху весь ролик.
+                self.log.emit("🖼️ Формат «по центру» (без кропа/зума)...")
+                from moviepy import ColorClip, CompositeVideoClip
+                scale  = min(w_out / clip.w, h_out / clip.h)
+                fitted = clip.resized(scale)
+                bg     = ColorClip(size=(w_out, h_out), color=(0, 0, 0), duration=clip.duration)
+                clip   = CompositeVideoClip([bg, fitted.with_position("center")], size=(w_out, h_out))
+                if fitted.audio is not None:
+                    clip = clip.with_audio(fitted.audio)
+            elif self.split_screen_enabled:
+                # Split-screen: исходник кропается в верхнюю половину экрана, в нижнюю —
+                # случайный фрагмент фоновой "нарезки" (Subway Surfers/песок/т.п.).
+                # Без зума/динамики — только статичный кроп в каждой половине.
+                self.log.emit("📱 Формат Split-screen...")
+                top_h = h_out // 2
+                orig_audio = clip.audio
+                top_clip = self._crop_to_fill(clip, w_out, top_h)
+                bg_clip = self._pick_background_clip(clip.duration)
+                if bg_clip is None:
+                    self.log.emit(
+                        f"⚠️ Папка background_footage/ пуста — фон будет чёрным. "
+                        f"Положите туда mp4/mov/mkv/webm с нарезкой."
+                    )
+                    from moviepy import ColorClip
+                    bg_clip = ColorClip(size=(w_out, top_h), color=(20, 20, 20), duration=clip.duration)
+                else:
+                    bg_clip = self._crop_to_fill(bg_clip, w_out, h_out - top_h)
+                from moviepy import CompositeVideoClip
+                clip = CompositeVideoClip(
+                    [top_clip.with_position((0, 0)), bg_clip.with_position((0, top_h))],
+                    size=(w_out, h_out)
+                )
+                if orig_audio is not None:
+                    clip = clip.with_audio(orig_audio)
+            else:
+                # Если зум включён, кадрируем с запасом ZOOM_CANVAS_MARGIN и отдаём этот запас
+                # под зум на этапе apply_dynamic_zoom — так зум всегда получается уменьшением
+                # (downscale), а не апскейлом уже финального кадра, откуда раньше бралось размытие.
+                zoom_margin = self.ZOOM_CANVAS_MARGIN if self.zoom_enabled else 1.0
+                crop_w, crop_h = int(w_out * zoom_margin), int(h_out * zoom_margin)
+
+                # ── Crop ──────────────────────────────────────
+                # Один проход ресайза (вместо двух последовательных width→height) —
+                # каждый лишний проход интерполяции размывает картинку.
+                if self.face_crop_enabled:
+                    self.log.emit("👤 Умный кроп...")
+                    try:
+                        resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.6)
+                        clip = SmartFaceCrop(crop_w, crop_h, smoothing=0.97, max_step=8,
+                                            multi_speaker=self.multi_speaker_crop).make_transform(resized)
+                        self.log.emit("✅ Face crop!")
+                    except Exception as e:
+                        self.log.emit(f"⚠️ Face crop: {e} → стандартный кроп")
+                        resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.5)
+                        clip = resized.cropped(x_center=resized.w/2, y_center=resized.h/2,
+                                              width=crop_w, height=crop_h)
+                else:
                     resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.5)
                     clip = resized.cropped(x_center=resized.w/2, y_center=resized.h/2,
                                           width=crop_w, height=crop_h)
-            else:
-                resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.5)
-                clip = resized.cropped(x_center=resized.w/2, y_center=resized.h/2,
-                                      width=crop_w, height=crop_h)
 
-            # ── Zoom (или просто финальный ресайз canvas → w_out×h_out) ─
-            if self.zoom_enabled:
-                self.log.emit("🎥 Зум...")
-                try:
-                    clip = self.apply_dynamic_zoom(clip, zoom_plan, w_out, h_out)
-                except Exception as e:
-                    self.log.emit(f"⚠️ Зум: {e}")
-                    clip = clip.resized((w_out, h_out))
+                # ── Zoom (или просто финальный ресайз canvas → w_out×h_out) ─
+                if self.zoom_enabled:
+                    self.log.emit("🎥 Зум...")
+                    try:
+                        clip = self.apply_dynamic_zoom(clip, zoom_plan, w_out, h_out)
+                    except Exception as e:
+                        self.log.emit(f"⚠️ Зум: {e}")
+                        clip = clip.resized((w_out, h_out))
 
             # ── Subtitles ─────────────────────────────────────
             self.log.emit("💬 Субтитры...")
@@ -1040,8 +1124,17 @@ class ProcessingThread(QThread):
                     self.log.emit(f"⚠️ Субтитры: {e}")
                     import traceback; self.log.emit(traceback.format_exc())
 
-            # ── Hook ──────────────────────────────────────────
-            if hook_text and self.hook_enabled:
+            # ── Hook / заголовок сверху ─────────────────────────
+            if self.centered_layout_enabled and title:
+                # В формате «по центру» вместо мигающего 3-секундного хука —
+                # постоянный заголовок сверху на весь ролик (title клипа).
+                self.log.emit("🏷️ Заголовок сверху...")
+                try:
+                    clip = HookOverlay(title, duration=clip.duration, persistent=True).apply(clip)
+                    self.log.emit("✅ Заголовок!")
+                except Exception as e:
+                    self.log.emit(f"⚠️ Заголовок: {e}")
+            elif hook_text and self.hook_enabled:
                 self.log.emit("🪝 Хук...")
                 try:
                     clip = HookOverlay(hook_text, duration=3.0).apply(clip)

@@ -18,6 +18,7 @@ build/
 clips/
 temp_processing/
 cache/
+background_footage/
 
 # Models (too large for git — download separately)
 models/

@@ -6,6 +6,10 @@ CLIPS_DIR          = os.path.join(BASE_DIR, "clips")
 WORK_DIR           = os.path.join(BASE_DIR, "temp_processing")
 CACHE_DIR          = os.path.join(BASE_DIR, "cache")
 TRANSCRIPT_CACHE_DIR = os.path.join(CACHE_DIR, "transcripts")
+# Фоновая "нарезка" (Subway Surfers, песок и т.п.) для режима split-screen —
+# пользователь сам кладёт сюда любые mp4/mov/mkv/webm файлы.
+BACKGROUND_FOOTAGE_DIR = os.path.join(BASE_DIR, "background_footage")
+os.makedirs(BACKGROUND_FOOTAGE_DIR, exist_ok=True)
 
 def _resolve_ffmpeg() -> str:
     # Бандл-версия ffmpeg.exe в корне проекта требует системных DLL (swscale и др.),

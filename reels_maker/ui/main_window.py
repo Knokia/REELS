@@ -132,6 +132,21 @@ class MainWindow(QMainWindow):
         self.multi_speaker_cb = QCheckBox("🗣️ Мультиспикерный кроп (переключение на говорящего)")
         self.multi_speaker_cb.setChecked(False)
         self.multi_speaker_cb.setStyleSheet("font-weight:bold;")
+        self.centered_layout_cb = QCheckBox(
+            "🖼️ Формат «по центру» (без кропа/зума, заголовок сверху, видео целиком по центру)"
+        )
+        self.centered_layout_cb.setChecked(False)
+        self.centered_layout_cb.setStyleSheet("font-weight:bold;")
+        self.split_screen_cb = QCheckBox(
+            "📱 Формат Split-screen (видео сверху, фоновая нарезка снизу — файлы в background_footage/)"
+        )
+        self.split_screen_cb.setChecked(False)
+        self.split_screen_cb.setStyleSheet("font-weight:bold;")
+        # Оба формата меняют композицию кадра целиком — включаем только один разом.
+        self.centered_layout_cb.toggled.connect(
+            lambda checked: checked and self.split_screen_cb.setChecked(False))
+        self.split_screen_cb.toggled.connect(
+            lambda checked: checked and self.centered_layout_cb.setChecked(False))
         emo_info = QLabel(
             "😊 Эмоции: MediaPipe Face Mesh (геометрия лица) + OpenCV Haar fallback\n"
             "   Зависимости: mediapipe, opencv-python — уже установлены"
@@ -146,6 +161,7 @@ class MainWindow(QMainWindow):
         info2.setWordWrap(True)
         al2.addWidget(self.face_crop_cb); al2.addWidget(self.hook_cb)
         al2.addWidget(self.virality_cb); al2.addWidget(self.multi_speaker_cb)
+        al2.addWidget(self.centered_layout_cb); al2.addWidget(self.split_screen_cb)
         al2.addWidget(emo_info); al2.addWidget(info2)
         ag2.setLayout(al2); layout.addWidget(ag2)
 
@@ -318,6 +334,8 @@ class MainWindow(QMainWindow):
             multi_speaker_crop=self.multi_speaker_cb.isChecked(),
             clip_count=self.clip_count_spin.value(),
             index_offset=index_offset,
+            centered_layout_enabled=self.centered_layout_cb.isChecked(),
+            split_screen_enabled=self.split_screen_cb.isChecked(),
         )
 
     def start_processing(self):

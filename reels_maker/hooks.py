@@ -8,15 +8,18 @@ from .subtitles import SubtitleRenderer
 class HookOverlay:
     ALPHA_LEVELS = 32
 
-    def __init__(self, hook_text: str, duration: float = 3.0):
-        self.hook_text = hook_text
-        self.duration  = duration
+    def __init__(self, hook_text: str, duration: float = 3.0, persistent: bool = False):
+        self.hook_text  = hook_text
+        self.duration   = duration
+        # persistent=True — заголовок держится весь ролик (только fade-in в начале,
+        # без fade-out), в отличие от обычного хука, который гаснет через duration сек.
+        self.persistent = persistent
         self._cache: dict = {}
 
     def _alpha_at(self, t: float) -> float:
         if t < 0.5:
             return t / 0.5
-        elif t > self.duration - 0.5:
+        elif not self.persistent and t > self.duration - 0.5:
             return (self.duration - t) / 0.5
         return 1.0
 
@@ -88,7 +91,7 @@ class HookOverlay:
         levels = self.ALPHA_LEVELS
 
         def add_hook(get_frame, t):
-            if t > self.duration:
+            if not self.persistent and t > self.duration:
                 return get_frame(t)
             alpha = max(0.0, min(1.0, self._alpha_at(t)))
             level = int(alpha * (levels - 1))
