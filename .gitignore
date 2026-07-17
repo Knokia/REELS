@@ -1,0 +1,38 @@
+# Secrets / local credentials
+client_secrets.json
+client_secret_*.json
+yt_oauth_creds.json
+yt_accounts.json
+yt_quota.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+build/
+*.spec.bak
+
+# App runtime data
+clips/
+temp_processing/
+cache/
+
+# Models (too large for git — download separately)
+models/
+*.gguf
+
+# Raw source footage / processing artifacts
+интерны/
+*TEMP_MPY*.mp4
+/пример.mp4
+
+# Bundled binaries (not project source)
+/ffmpeg.exe
+/ffprobe.exe
+/ImageMagick-*.exe
+
+# IDE
+.idea/
+.claude/

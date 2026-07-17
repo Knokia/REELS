@@ -1,0 +1,1067 @@
+import contextlib
+import gc
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ctranslate2 (faster-whisper backend) dynamically links cublas64_12.dll,
+# resolved via CUDA_PATH\bin rather than the normal Windows DLL search order.
+# On this machine CUDA_PATH points at a CUDA 13.x toolkit (needed to build
+# llama-cpp-python with CUDA), which only ships cublas64_13.dll, while
+# ctranslate2 was built against CUDA 12.x — hence "cublas64_12.dll is not
+# found". _CUBLAS_PKG_DIR is the nvidia-cublas-cu12 pip package's own dir
+# (has a matching cublas64_12.dll); _cuda_path_for_ctranslate2() temporarily
+# points CUDA_PATH there ONLY around the Whisper call. It can't be set
+# globally at import time: llama_cpp reads the *real* CUDA_PATH\lib at
+# import time to find its own CUDA build, and would crash if it were
+# already overridden by then.
+_CUBLAS_PKG_DIR = None
+
+
+def _register_nvidia_dll_dirs():
+    global _CUBLAS_PKG_DIR
+    if os.name != "nt":
+        return
+    try:
+        import nvidia.cublas
+        import nvidia.cudnn
+        import nvidia.cuda_nvrtc
+    except ImportError:
+        return
+    for pkg in (nvidia.cublas, nvidia.cudnn, nvidia.cuda_nvrtc):
+        pkg_dir = next(iter(pkg.__path__), None)
+        if not pkg_dir:
+            continue
+        bin_dir = os.path.join(pkg_dir, "bin")
+        if os.path.isdir(bin_dir):
+            os.add_dll_directory(bin_dir)
+
+    _CUBLAS_PKG_DIR = next(iter(nvidia.cublas.__path__), None)
+
+
+@contextlib.contextmanager
+def _cuda_path_for_ctranslate2():
+    if not _CUBLAS_PKG_DIR:
+        yield
+        return
+    old = os.environ.get("CUDA_PATH")
+    os.environ["CUDA_PATH"] = _CUBLAS_PKG_DIR
+    try:
+        yield
+    finally:
+        if old is not None:
+            os.environ["CUDA_PATH"] = old
+        else:
+            os.environ.pop("CUDA_PATH", None)
+
+
+_register_nvidia_dll_dirs()
+
+import numpy as np
+from faster_whisper import BatchedInferencePipeline, WhisperModel
+from llama_cpp import Llama
+from moviepy import VideoFileClip
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from .analysis import MultimodalAnalyzer
+from .config import CLIPS_DIR, FFMPEG_EXE, FONT_SETTINGS, MODELS_DIR, TRANSCRIPT_CACHE_DIR, WORK_DIR
+from .emotion import EmotionDetector
+from .face_crop import SmartFaceCrop
+from .hooks import HookOverlay
+from .scenes import detect_scenes
+from . import sponsorblock
+from .subtitles import SubtitleRenderer
+from .virality import ViralityScorer
+
+
+class ProcessingThread(QThread):
+    log      = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object)
+
+    # Кандидатов для анализа всегда берём больше, чем нужно финальных клипов —
+    # иначе скорингу виральности физически не из чего отсеивать слабые.
+    CANDIDATE_OVERHEAD = 8
+    MAX_CANDIDATES = 25
+    MIN_VIRALITY_SCORE = 0.25
+
+    def __init__(self, url, quality, language, clip_duration,
+                 zoom_enabled, zoom_intensity,
+                 face_crop_enabled=True, hook_enabled=True, virality_enabled=True,
+                 multi_speaker_crop=False, clip_count=7, index_offset=0):
+        super().__init__()
+        self.url               = url
+        self.quality           = quality
+        self.language           = language
+        self.clip_duration     = clip_duration
+        self.zoom_enabled      = zoom_enabled
+        self.zoom_intensity    = zoom_intensity
+        self.face_crop_enabled = face_crop_enabled
+        self.hook_enabled      = hook_enabled
+        self.virality_enabled  = virality_enabled
+        self.multi_speaker_crop = multi_speaker_crop
+        self.clip_count         = clip_count
+        self.index_offset       = index_offset
+        self._download_finished = False
+        self._last_download_log = -5
+        self.srt_path           = None
+        self._llm               = None
+        self.video_title        = None
+        # Подпапка clips/<название видео>/ — вычисляется в начале run(), чтобы
+        # клипы разных исходников не смешивались в одной общей папке.
+        self.clip_subdir        = None
+        self.sponsor_segments   = []
+        # Заголовки, уже сгенерированные в этом прогоне — подсказываем модели
+        # их не повторять, иначе все клипы одного видео скатываются в один шаблон.
+        self._generated_titles  = []
+
+    # ── Model loading ─────────────────────────────────────────
+
+    def find_model(self):
+        if not os.path.exists(MODELS_DIR):
+            raise Exception("Создай папку 'models' и положи .gguf файл.")
+        gguf = sorted(f for f in os.listdir(MODELS_DIR) if f.endswith('.gguf'))
+        if not gguf:
+            raise Exception(f"Нет .gguf в {MODELS_DIR}")
+        pat    = re.compile(r'-(\d+)-of-(\d+)\.gguf$', re.IGNORECASE)
+        splits = [f for f in gguf if pat.search(f)]
+        chosen = ([f for f in splits if pat.search(f).group(1) == '00001']
+                  or splits or [None])[0] or gguf[0]
+        self.log.emit(f"🔍 Модель: {chosen}")
+        return os.path.join(MODELS_DIR, chosen)
+
+    def load_llm(self):
+        mp2   = self.find_model()
+        pat   = re.compile(r'-(\d+)-of-(\d+)\.gguf$', re.IGNORECASE)
+        match = pat.search(os.path.basename(mp2))
+        kwargs = dict(model_path=mp2, n_ctx=32768, n_threads=4, verbose=False)
+        if match:
+            kwargs['n_gpu_layers'] = 0
+        try:
+            return Llama(**kwargs)
+        except ValueError as e:
+            err = str(e)
+            if 'Failed to load model' in err and match:
+                base = pat.sub('.gguf', os.path.basename(mp2))
+                bp   = os.path.join(os.path.dirname(mp2), base)
+                if os.path.exists(bp):
+                    kwargs['model_path'] = bp
+                    return Llama(**kwargs)
+            raise
+
+    # ── Transcript cache ──────────────────────────────────────
+
+    def _transcript_cache_key(self, video_path, is_local):
+        if is_local:
+            raw = f"local:{os.path.abspath(self.url)}:{os.path.getsize(self.url)}:{os.path.getmtime(self.url)}"
+        else:
+            raw = f"url:{self.url}:{self.language}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _load_cached_transcript(self, key):
+        path = os.path.join(TRANSCRIPT_CACHE_DIR, f"{key}.json")
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if not d.get("words"):
+                return None  # старый "отравленный" пустой кэш — считаем промахом
+            return d["text"], d["words"]
+        except Exception:
+            return None
+
+    def _save_cached_transcript(self, key, text, words):
+        if not words:
+            # Пустая транскрипция почти всегда значит, что распознавание не
+            # сработало (а не что в видео реально нет речи) — не кэшируем,
+            # иначе одна неудачная попытка молча "протухает" во все последующие
+            # запуски с тем же файлом.
+            return
+        try:
+            os.makedirs(TRANSCRIPT_CACHE_DIR, exist_ok=True)
+            path = os.path.join(TRANSCRIPT_CACHE_DIR, f"{key}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"text": text, "words": words}, f)
+        except Exception:
+            pass
+
+    # ── Main run ──────────────────────────────────────────────
+
+    def run(self):
+        try:
+            os.makedirs(WORK_DIR, exist_ok=True)
+            is_local = os.path.isfile(self.url)
+
+            if is_local:
+                self.log.emit("=== ЛОКАЛЬНЫЙ ФАЙЛ ===")
+                self.video_title = os.path.splitext(os.path.basename(self.url))[0]
+                video_path = os.path.join(WORK_DIR, "video.mp4")
+                shutil.copy2(self.url, video_path)
+                self.progress.emit(20)
+            else:
+                self.log.emit("=== СКАЧИВАЕМ С YOUTUBE ===")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    video_path = os.path.join(WORK_DIR, "video.mp4")
+                    shutil.copy2(self.download_youtube(tmpdir), video_path)
+                    if self.srt_path and os.path.exists(self.srt_path):
+                        new_srt = os.path.join(WORK_DIR, "subtitles.srt")
+                        shutil.copy2(self.srt_path, new_srt)
+                        self.srt_path = new_srt
+
+                video_id = sponsorblock.extract_video_id(self.url)
+                if video_id:
+                    self.sponsor_segments = sponsorblock.fetch_segments(video_id)
+                    if self.sponsor_segments:
+                        self.log.emit(
+                            f"🚫 SponsorBlock: {len(self.sponsor_segments)} рекламных сегментов "
+                            f"будут исключены из нарезки"
+                        )
+
+            self.clip_subdir = self._make_video_folder(self.video_title)
+            self.log.emit(f"📁 Клипы: clips/{self.clip_subdir}/")
+
+            self.log.emit("\n=== ТРАНСКРИБАЦИЯ ==="); self.progress.emit(25)
+            cache_key = self._transcript_cache_key(video_path, is_local)
+            cached    = self._load_cached_transcript(cache_key)
+            if cached:
+                text, words = cached
+                self.log.emit(f"✅ Транскрипт из кэша | Слов: {len(words)}")
+            else:
+                text, words = self.transcribe(video_path)
+                self._save_cached_transcript(cache_key, text, words)
+
+            try:
+                with VideoFileClip(video_path) as _probe:
+                    real_duration = _probe.duration or 0.0
+            except Exception:
+                real_duration = 0.0
+
+            if not words:
+                # Распознавание речи не дало текста (не только пустое видео —
+                # часто это сбой ASR). Берём реальную длину видео, а не
+                # фиктивные 60с — иначе поиск моментов схлопывается в первую
+                # минуту вместо всего ролика. Субтитров в клипах не будет.
+                duration = real_duration or 60.0
+                self.log.emit(
+                    f"⚠️ Транскрипция пуста — субтитров не будет, поиск моментов "
+                    f"пойдёт по всей длине видео ({duration:.0f}с) без текста"
+                )
+            else:
+                covered = words[-1]['end']
+                if real_duration and covered < real_duration * 0.7:
+                    # Распознано заметно меньше, чем реальная длина видео — скорее
+                    # всего Whisper прервался раньше конца. Ищем моменты по всей
+                    # длине видео (не только по покрытой части), но за пределами
+                    # covered субтитров не будет — это лучше, чем схлопнуть всё
+                    # в маленькое окно распознанного куска.
+                    self.log.emit(
+                        f"⚠️ Транскрипт покрывает только {covered:.0f}с из {real_duration:.0f}с "
+                        f"видео — распознавание, похоже, прервалось раньше конца. Часть видео "
+                        f"может остаться без субтитров."
+                    )
+                    duration = real_duration
+                else:
+                    duration = covered
+
+            self.log.emit("\n=== СЦЕНЫ ==="); self.progress.emit(30)
+            scenes = detect_scenes(video_path)
+            self.log.emit(f"✅ Сцен: {len(scenes)}" if scenes else "⚠️ scenedetect недоступен")
+
+            self.log.emit("\n=== МУЛЬТИМОДАЛЬНЫЙ АНАЛИЗ ==="); self.progress.emit(35)
+            audio_energies, beats, silences, laugh_events = {}, [], [], []
+            try:
+                audio_y, audio_sr = MultimodalAnalyzer.load_audio(video_path)
+                audio_energies = MultimodalAnalyzer.extract_audio_energy(audio_y, audio_sr)
+                self.log.emit(f"🎵 Энергия: {len(audio_energies)} точек")
+                beats = MultimodalAnalyzer.detect_beats(audio_y, audio_sr)
+                self.log.emit(f"🥁 Битов: {len(beats)}")
+                silences = MultimodalAnalyzer.detect_silence_gaps(audio_y, audio_sr)
+                self.log.emit(f"🔕 Пауз: {len(silences)}")
+                laugh_events = MultimodalAnalyzer.detect_laugh_applause(audio_y, audio_sr)
+                self.log.emit(f"😂 События: {len(laugh_events)}")
+                del audio_y
+            except Exception as e:
+                self.log.emit(f"⚠️ Аудио-анализ недоступен ({e}) — зум/скоринг будут работать без него")
+            face_timeline  = MultimodalAnalyzer.detect_faces_timeline(video_path, 0.5)
+            self.log.emit(f"👤 Кадров с лицами: {len(face_timeline)}")
+
+            # Эмоции — только MediaPipe + OpenCV Haar (без сторонних ML)
+            self.log.emit("😊 Определяю эмоции (MediaPipe Face Mesh)...")
+            emotion_timeline = EmotionDetector.detect_timeline(video_path, sample_fps=0.33)
+            if emotion_timeline:
+                counts: dict = {}
+                for e in emotion_timeline.values():
+                    counts[e] = counts.get(e, 0) + 1
+                top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]
+                self.log.emit(
+                    f"   ✅ {len(emotion_timeline)} кадров | "
+                    + ", ".join(f"{e}={c}" for e, c in top)
+                )
+            else:
+                self.log.emit("   ⚠️ MediaPipe недоступен — субтитры белые")
+
+            speech_rates    = MultimodalAnalyzer.speech_rate(words)
+            sent_boundaries = MultimodalAnalyzer.find_sentence_boundaries(words)
+            self.log.emit(f"📝 Границ предложений: {len(sent_boundaries)}")
+
+            self.log.emit("\n=== ЛУЧШИЕ МОМЕНТЫ ==="); self.progress.emit(50)
+            self._llm = self.load_llm()
+            candidate_count = min(self.MAX_CANDIDATES, self.clip_count + self.CANDIDATE_OVERHEAD)
+            highlights = self.find_highlights(text, duration, scenes, count=candidate_count)
+            self.log.emit(f"🔎 Кандидатов: {len(highlights)} (нужно клипов: {self.clip_count})")
+            for h in highlights:
+                ws = h.get('start_time', 0); we = h.get('end_time', ws + 30)
+                h['_text_snippet'] = " ".join(
+                    w['word'] for w in words if ws <= w['start'] <= we
+                )[:500]
+
+            if self.virality_enabled:
+                self.log.emit("\n=== СКОРИНГ ВИРАЛЬНОСТИ ==="); self.progress.emit(55)
+                highlights = ViralityScorer.score_highlights(
+                    highlights, words, audio_energies,
+                    face_timeline, speech_rates, laugh_events
+                )
+                for i, h in enumerate(highlights):
+                    vs  = h.get('virality_score', 0.0)
+                    bar = '█' * int(vs * 10) + '░' * (10 - int(vs * 10))
+                    self.log.emit(f"   #{i+1} [{bar}] {vs:.3f}")
+                before = len(highlights)
+                highlights = [h for h in highlights
+                             if h.get('virality_score', 0.0) >= self.MIN_VIRALITY_SCORE][:self.clip_count]
+                highlights.sort(key=lambda x: x['start_time'])
+                self.log.emit(
+                    f"🧹 Отсеяно {before - len(highlights)} слабых момент(ов) "
+                    f"(порог {self.MIN_VIRALITY_SCORE}) → в работу: {len(highlights)}"
+                )
+            else:
+                highlights = highlights[:self.clip_count]
+
+            self.log.emit("\n🎯 Умная привязка границ...")
+            for h in highlights:
+                for key in ('start_time', 'end_time'):
+                    t2 = h[key]
+                    t2 = MultimodalAnalyzer.snap_to_sentence_boundary(t2, sent_boundaries)
+                    t2 = MultimodalAnalyzer.snap_to_silence(t2, silences)
+                    if beats:
+                        t2 = MultimodalAnalyzer.snap_to_beat(t2, beats)
+                    h[key] = t2
+                if h['end_time'] - h['start_time'] < 5:
+                    h['end_time'] = h['start_time'] + self.clip_duration
+
+            self.log.emit(f"\n=== ГЕНЕРАЦИЯ ЗАГОЛОВКОВ/ХУКОВ ({len(highlights)}) ===")
+            render_jobs = []
+            for i, h in enumerate(highlights, 1):
+                self.progress.emit(55 + int(i / len(highlights) * 10))
+                clip_title = self.generate_clip_title(text, h, words)
+                self.log.emit(f"📛 {i}/{len(highlights)}: {clip_title}")
+                hook_text = self.generate_hook(text, h, words) if self.hook_enabled else None
+                zoom_plan = (self.analyze_zoom_points(text, h, words, audio_energies)
+                             if self.zoom_enabled else None)
+                render_jobs.append({'highlight': h, 'title': clip_title,
+                                     'hook_text': hook_text, 'zoom_plan': zoom_plan})
+
+            # LLM больше не нужен — освобождаем память перед параллельным рендером
+            del self._llm; self._llm = None; gc.collect()
+
+            workers = max(1, min(3, (os.cpu_count() or 2) // 2))
+            ffmpeg_threads = max(1, (os.cpu_count() or 4) // workers)
+            self.log.emit(f"\n=== НАРЕЗКА {len(render_jobs)} КЛИПОВ (потоков: {workers}) ===")
+
+            output_clips = [None] * len(render_jobs)
+
+            def _render(idx, job):
+                h = job['highlight']
+                try:
+                    path = self.cut_and_caption(
+                        video_path, h['start_time'], h['end_time'], words,
+                        job['title'], job['zoom_plan'], job['hook_text'],
+                        emotion_timeline, ffmpeg_threads=ffmpeg_threads,
+                        index=self.index_offset + idx,
+                    )
+                    return idx, {
+                        'path':           path,
+                        'title':          job['title'],
+                        'filename':       os.path.basename(path),
+                        'start':          h['start_time'],
+                        'end':            h['end_time'],
+                        'duration':       h['end_time'] - h['start_time'],
+                        'reason':         h.get('reason', ''),
+                        'virality_score': h.get('virality_score', 0.0),
+                        'hook':           job['hook_text'] or '',
+                    }
+                except Exception as e:
+                    self.log.emit(f"⚠️ Клип {idx + 1}: {e}")
+                    return idx, None
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_render, i, job) for i, job in enumerate(render_jobs)]
+                done = 0
+                for fut in as_completed(futures):
+                    idx, clip = fut.result()
+                    output_clips[idx] = clip
+                    done += 1
+                    self.progress.emit(65 + int(done / len(render_jobs) * 30))
+
+            output_clips = [c for c in output_clips if c]
+
+            self.progress.emit(100)
+            self.log.emit(f"\n✅ Клипов: {len(output_clips)}")
+            if output_clips:
+                self.log.emit("\n📊 Топ по виральности:")
+                for c in sorted(output_clips,
+                                key=lambda x: x['virality_score'], reverse=True):
+                    self.log.emit(f"   {c['virality_score']:.3f} | {c['filename']}")
+
+            EmotionDetector.cleanup()
+            try:
+                gc.collect(); time.sleep(1)
+                shutil.rmtree(WORK_DIR, ignore_errors=True)
+            except Exception:
+                pass
+            self.finished.emit(output_clips)
+
+        except Exception as e:
+            self.log.emit(f"❌ {e}")
+            import traceback; self.log.emit(traceback.format_exc())
+            shutil.rmtree(WORK_DIR, ignore_errors=True)
+            self.finished.emit([])
+
+    # ── Download / transcribe ─────────────────────────────────
+
+    def progress_hook(self, d):
+        if d.get('status') == 'downloading':
+            try:
+                pct = float(d.get('_percent_str', '0%').replace('%', '').strip())
+                self.progress.emit(int(pct * 0.25))
+                if int(pct) >= self._last_download_log + 5:
+                    self._last_download_log = int(pct) - (int(pct) % 5)
+                    self.log.emit(f"📥 {int(pct)}% ({d.get('_speed_str','N/A')})")
+            except Exception:
+                pass
+        elif d.get('status') == 'finished' and not self._download_finished:
+            self._download_finished = True
+            self.log.emit("✅ Скачано!")
+
+    def download_youtube(self, tmpdir):
+        qmap = {
+            "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]",
+            "360p":  "bestvideo[height<=360]+bestaudio/best[height<=360]",
+        }
+        import yt_dlp
+        opts = {
+            'format': qmap.get(self.quality, 'best'),
+            'outtmpl': os.path.join(tmpdir, 'video.%(ext)s'),
+            'quiet': True, 'no_warnings': True, 'merge_output_format': 'mp4',
+            'ffmpeg_location': FFMPEG_EXE,
+            'progress_hooks': [self.progress_hook],
+            'writesubtitles': True, 'writeautomaticsub': True,
+            'subtitleslangs': ['ru', 'en'], 'subtitlesformat': 'srt',
+        }
+        if 'youtube.com' in self.url or 'youtu.be' in self.url:
+            opts['http_headers'] = {'User-Agent': 'Mozilla/5.0'}
+            # Не форсируем player_client: жёсткий ['web','android'] лишал yt-dlp
+            # доступа к форматам выше 360p (android сейчас режется YouTube SABR-
+            # экспериментом) — стандартный автовыбор клиента у yt-dlp видит 4K.
+        info = None
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(self.url, download=True)
+        except Exception as e:
+            if '429' in str(e):
+                self.log.emit("⚠️ 429 Too Many Requests — повтор без субтитров...")
+                opts['writesubtitles'] = opts['writeautomaticsub'] = False
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=True)
+            else:
+                self.log.emit(f"❌ yt-dlp: {e}")
+                raise
+        if info:
+            self.video_title = info.get('title', '')
+        video_file = None
+        for f in os.listdir(tmpdir):
+            if f.endswith('.mp4'):
+                video_file = os.path.join(tmpdir, f)
+            elif f.endswith('.srt'):
+                self.srt_path = os.path.join(tmpdir, f)
+        if not video_file:
+            raise Exception("Видео не найдено")
+        return video_file
+
+    def parse_youtube_srt(self, srt_path):
+        words, full_text = [], ""
+        if not os.path.exists(srt_path):
+            return full_text, words
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        pat = r'(\d+:\d{2}:\d{2},\d{3}) --> (\d+:\d{2}:\d{2},\d{3})\n(.+?)(?=\n\n|\Z)'
+        def to_sec(t):
+            h2, m, s = t.split(':'); s, ms = s.split(',')
+            return int(h2)*3600 + int(m)*60 + int(s) + int(ms)/1000
+        for ss, es, txt in re.findall(pat, content, re.DOTALL):
+            s, e = to_sec(ss), to_sec(es)
+            clean = re.sub(r'<[^>]+>', '', txt).strip()
+            full_text += clean + " "
+            wl = clean.split()
+            if wl:
+                dur2 = (e - s) / len(wl)
+                for i, w in enumerate(wl):
+                    words.append({"word": w, "start": s+i*dur2, "end": s+(i+1)*dur2})
+        return full_text, words
+
+    def transcribe(self, video_path):
+        # Whisper даёт заметно точнее тайминг/текст, чем автосубтитры YouTube —
+        # предпочитаем его, а субтитры YouTube оставляем как запасной вариант,
+        # если Whisper недоступен/упал.
+        with _cuda_path_for_ctranslate2():
+            try:
+                model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+                self.log.emit("🔊 Whisper large-v3 (CUDA)...")
+            except Exception:
+                model = None
+            if model is None:
+                try:
+                    model = WhisperModel("small", device="cpu", compute_type="int8")
+                    self.log.emit("🔊 Whisper small (CPU, GPU недоступен)...")
+                except Exception:
+                    model = None
+
+            if model is not None:
+                # text/words — СНАРУЖИ try: если генератор сегментов упадёт на середине
+                # длинного видео (например, не хватило VRAM), то, что уже успели
+                # распознать, не должно тонуть вместе с исключением.
+                text, words = "", []
+                try:
+                    segs, _ = BatchedInferencePipeline(model=model).transcribe(
+                        video_path, batch_size=16,
+                        language=None if self.language == "Авто" else self.language.lower(),
+                        word_timestamps=True, vad_filter=True
+                    )
+                    for seg in segs:
+                        text += seg.text + " "
+                        if seg.words:
+                            for w in seg.words:
+                                words.append({"word": w.word, "start": w.start, "end": w.end})
+                except Exception as e:
+                    self.log.emit(f"⚠️ Whisper прервался на середине ({e}) — использую то, что успел распознать")
+                finally:
+                    del model; gc.collect()
+
+                if words:
+                    self.log.emit(f"✅ Слов: {len(words)}")
+                    return text, words
+
+        if self.srt_path and os.path.exists(self.srt_path):
+            self.log.emit("📝 Использую субтитры YouTube (запасной вариант)...")
+            text, words = self.parse_youtube_srt(self.srt_path)
+            if words:
+                self.log.emit(f"✅ Слов: {len(words)}")
+                return text, words
+
+        return "", []
+
+    # ── LLM-driven planning ────────────────────────────────────
+    # Модель — Qwen2.5-instruct, использует формат ChatML (не Mistral [INST]),
+    # см. её собственный tokenizer.chat_template и eos_token=<|im_end|>.
+
+    CHAT_STOP = ["<|im_end|>", "<|endoftext|>"]
+
+    @staticmethod
+    def _chat_prompt(user_content: str) -> str:
+        return f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
+
+    # На практике запрос, упирающийся почти вплотную в n_ctx, у llama.cpp с этой
+    # репак-квантизацией (CPU_REPACK q4_K_8x8) на больших батчах иногда валит
+    # процесс нативным крашем (0xC0000409) вместо аккуратного исключения — Python
+    # try/except такое не ловит. Поэтому держим используемый контекст с большим
+    # запасом от полного n_ctx, а не впритык.
+    MAX_PROMPT_TOKENS = 12000
+
+    def _fit_text_to_context(self, text: str, prompt_template: str, max_tokens: int, safety: int = 500) -> str:
+        """Обрезает text по фактическому числу токенов модели (а не наугад по
+        символам), но не приближается к границе n_ctx — см. MAX_PROMPT_TOKENS.
+        prompt_template — тот же промпт с text="" внутри, чтобы посчитать
+        накладные расходы (инструкции, список сцен и т.п.)."""
+        n_ctx = self._llm.n_ctx()
+        other_tokens = len(self._llm.tokenize(prompt_template.encode("utf-8"), add_bos=True))
+        budget = min(n_ctx - other_tokens - max_tokens - safety, self.MAX_PROMPT_TOKENS)
+        if budget <= 0:
+            return ""
+        tokens = self._llm.tokenize(text.encode("utf-8"), add_bos=False)
+        if len(tokens) <= budget:
+            return text
+        return self._llm.detokenize(tokens[:budget]).decode("utf-8", errors="ignore")
+
+    def find_highlights(self, text, duration, scenes, count=7):
+        self.log.emit("🤔 LLM...")
+        sc = "\n".join(
+            f"Сцена {i+1}: {s:.1f}s—{e:.1f}s" for i, (s, e) in enumerate(scenes[:50])
+        ) if scenes else ""
+
+        def build_prompt(video_text):
+            return self._chat_prompt(
+                f"Найди {count} лучших моментов для Shorts "
+                f"(длина {duration:.0f}с, каждый ~{self.clip_duration}с±10с).\n"
+                f"{'Сцены:\n'+sc+chr(10) if sc else ''}"
+                f'Текст: "{video_text}"\n'
+                f'Ответь ТОЛЬКО валидным JSON без пояснений: '
+                f'[{{"start_time":число,"end_time":число,"reason":"..."}},...]'
+            )
+
+        max_tokens = 800
+        fitted_text = self._fit_text_to_context(text, build_prompt(""), max_tokens)
+        prompt = build_prompt(fitted_text)
+        self.log.emit(f"📚 Контекст LLM: {len(fitted_text)}/{len(text)} символов транскрипта")
+        out = self._llm(prompt, max_tokens=max_tokens, temperature=0.7, stop=self.CHAT_STOP, echo=False)
+        raw = out['choices'][0]['text']
+        try:
+            m = re.search(r'\[.*\]', raw, re.DOTALL)
+            highlights = json.loads(m.group()) if m else []
+        except Exception:
+            highlights = []
+        valid = []
+        if scenes:
+            for h in highlights:
+                st, et = h.get('start_time', 0), h.get('end_time', 0)
+                if 0 <= st < et <= duration:
+                    for ss, se in scenes:
+                        if st >= ss - 1 and et <= se + 1:
+                            h['start_time'], h['end_time'] = ss, se; break
+                    valid.append(h)
+        else:
+            valid = [h for h in highlights
+                     if 0 <= h.get('start_time', 0) < h.get('end_time', 0) <= duration]
+
+        before_dedup = len(valid)
+        valid = self._dedupe_highlights(valid)
+        if before_dedup - len(valid):
+            self.log.emit(
+                f"🧬 Убрано {before_dedup - len(valid)} дублирующихся момент(ов) "
+                f"(привязка к одной и той же сцене/пересекающиеся тайм-коды)"
+            )
+
+        if self.sponsor_segments:
+            before = len(valid)
+            valid = [h for h in valid
+                     if not self._overlaps_sponsor(h['start_time'], h['end_time'])]
+            if before - len(valid):
+                self.log.emit(f"🚫 Отфильтровано {before - len(valid)} момент(ов) с рекламой")
+
+        if len(valid) < 2:
+            seg = (duration - 20) / count
+            for i in range(count):
+                s = 10 + i * seg
+                e = min(s + self.clip_duration, duration - 2)
+                if self._overlaps_sponsor(s, e):
+                    continue
+                valid.append({"start_time": s, "end_time": e, "reason": f"Авто {i+1}"})
+            valid = self._dedupe_highlights(valid)
+        return sorted(valid[:count], key=lambda x: x['start_time'])
+
+    @staticmethod
+    def _dedupe_highlights(highlights: list, overlap_ratio: float = 0.5) -> list:
+        """Убирает моменты, которые более чем на overlap_ratio пересекаются с уже
+        принятым — привязка к границам сцены может схлопнуть несколько разных
+        предложений LLM в один и тот же диапазон, и без этой проверки они бы
+        превратились в несколько клипов с одинаковым содержимым."""
+        result = []
+        for h in sorted(highlights, key=lambda x: x['start_time']):
+            st, et = h['start_time'], h['end_time']
+            is_dup = False
+            for r in result:
+                rst, ret = r['start_time'], r['end_time']
+                overlap = max(0.0, min(et, ret) - max(st, rst))
+                union   = max(et, ret) - min(st, rst)
+                if union > 0 and overlap / union > overlap_ratio:
+                    is_dup = True
+                    break
+            if not is_dup:
+                result.append(h)
+        return result
+
+    def _overlaps_sponsor(self, start: float, end: float) -> bool:
+        if not self.sponsor_segments:
+            return False
+        overlap = sum(max(0, min(end, e) - max(start, s)) for s, e in self.sponsor_segments)
+        return overlap > (end - start) * 0.25
+
+    def generate_clip_title(self, full_text, highlight, words):
+        mw = [w['word'] for w in words
+              if highlight['start_time'] <= w['start'] <= highlight['end_time']]
+        mt = " ".join(mw)[:600] or full_text[:600]
+
+        avoid = ""
+        recent = self._generated_titles[-6:]
+        if recent:
+            avoid = (
+                "\nУже придуманные названия для других клипов этого видео — "
+                "не повторяй их структуру, первое слово или приём:\n"
+                + "\n".join(f"- {t}" for t in recent)
+            )
+
+        out = self._llm(
+            self._chat_prompt(
+                "Придумай короткое (4-8 слов) цепляющее название на русском для "
+                "этого фрагмента видео. Каждый раз используй РАЗНЫЙ приём: то живая "
+                "цитата/реплика персонажа, то конкретная деталь из фрагмента, то "
+                "реакция, то интрига-вопрос. НЕ начинай с шаблонных клише вроде "
+                "«Как...», «Секрет...», «Вы не поверите...», «Один трюк...» — "
+                "заголовок должен быть конкретным, про ЭТОТ фрагмент, а не общим. "
+                "Ответь только названием, без кавычек и пояснений."
+                f'{avoid}\nФрагмент: "{mt}"'
+            ),
+            max_tokens=25, temperature=0.95, top_p=0.92,
+            stop=self.CHAT_STOP + ["\n"], echo=False
+        )
+        title = out['choices'][0]['text'].strip()
+        title = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'^\d+[\.\)]\s*', '', title).split('\n')[0].strip().strip('"\'«»:.-')
+        title = re.sub(r'[<>:"/\\|?*]', '', title)[:70]
+        if not title or len(title) < 5:
+            title = f"Момент в {int(highlight['start_time'])}с"
+        self._generated_titles.append(title)
+        return title
+
+    def generate_hook(self, full_text, highlight, words):
+        mw = [w['word'] for w in words
+              if highlight['start_time'] <= w['start'] <= highlight['end_time']]
+        mt = " ".join(mw)[:500] or full_text[:500]
+        out = self._llm(
+            self._chat_prompt(
+                "Создай ОДИН короткий интригующий хук (до 8 слов) для YouTube Shorts "
+                f'на русском. Ответь только хуком, без кавычек и пояснений.\nФрагмент: "{mt}"'
+            ),
+            max_tokens=20, temperature=0.9, top_p=0.95,
+            stop=self.CHAT_STOP + ["\n"], echo=False
+        )
+        hook = out['choices'][0]['text'].strip().strip('"\'«»').split('\n')[0].strip()[:80]
+        if not hook or len(hook) < 5:
+            hook = "Ты не поверишь что произошло..."
+        self.log.emit(f"🪝 {hook}")
+        return hook
+
+    def audio_driven_zoom_plan(self, highlight, audio_energies):
+        """Ищет пики аудио-энергии внутри клипа и строит по ним план зума —
+        точнее совпадает с эмоциональными акцентами, чем догадки LLM по тексту."""
+        st, et = highlight['start_time'], highlight['end_time']
+        local = sorted((t - st, v) for t, v in audio_energies.items() if st <= t <= et)
+        if len(local) < 5:
+            return None
+        values = [v for _, v in local]
+        mean, std = float(np.mean(values)), float(np.std(values))
+        if std < 1e-6:
+            return None
+        threshold = mean + 0.75 * std
+        peaks = [
+            (t, v) for i, (t, v) in enumerate(local)
+            if v >= threshold and v == max(vv for _, vv in local[max(0, i - 2):i + 3])
+        ]
+        if not peaks:
+            return None
+        peaks.sort(key=lambda p: -p[1])
+        selected = []
+        for t, v in peaks:
+            if all(abs(t - st2) > 3.0 for st2, _ in selected):
+                selected.append((t, v))
+            if len(selected) >= 3:
+                break
+        if not selected:
+            return None
+        vmax = max(v for _, v in selected)
+        bi = self.zoom_intensity / 100 * 0.25
+        return [
+            {"time": t, "action": "zoom_in", "intensity": bi * (0.5 + 0.5 * (v / vmax))}
+            for t, v in sorted(selected)
+        ]
+
+    def analyze_zoom_points(self, full_text, highlight, words, audio_energies=None):
+        if audio_energies:
+            plan = self.audio_driven_zoom_plan(highlight, audio_energies)
+            if plan:
+                return plan
+        mw = [w['word'] for w in words
+              if highlight['start_time'] <= w['start'] <= highlight['end_time']]
+        mt = " ".join(mw)[:800]
+        if not mt:
+            return None
+        dur = highlight['end_time'] - highlight['start_time']
+        bi  = self.zoom_intensity / 100 * 0.25
+        out = self._llm(
+            self._chat_prompt(
+                f"Найди 2-3 момента для зума в {dur:.0f}с клипе.\n"
+                f'Текст: "{mt}"\n'
+                f'Ответь ТОЛЬКО валидным JSON без пояснений: '
+                f'[{{"time":сек,"action":"zoom_in/zoom_out/normal","intensity":0.05-0.2}}]'
+            ),
+            max_tokens=200, temperature=0.6, stop=self.CHAT_STOP, echo=False
+        )
+        raw = out['choices'][0]['text'].strip()
+        try:
+            m = re.search(r'\[.*\]', raw, re.DOTALL)
+            if m:
+                plan  = json.loads(m.group())
+                valid = [
+                    {'time': z['time'], 'action': z['action'],
+                     'intensity': min(z.get('intensity', 0.1) * (self.zoom_intensity / 50), bi)}
+                    for z in plan
+                    if 0 <= z.get('time', -1) <= dur
+                    and z.get('action') in ['zoom_in', 'zoom_out', 'normal']
+                ]
+                if valid:
+                    return valid
+        except Exception:
+            pass
+        return [
+            {"time": dur * 0.3, "action": "zoom_in",  "intensity": bi * 0.6},
+            {"time": dur * 0.7, "action": "zoom_out", "intensity": bi * 0.4},
+        ]
+
+    # Во сколько раз canvas (кадр перед зумом) больше финального разрешения.
+    # Должен быть >= максимального зума ниже, чтобы окно кропа при зуме никогда
+    # не оказывалось меньше финального кадра — тогда resize всегда downscale,
+    # а не апскейл (апскейл — источник размытия при сильном зуме).
+    ZOOM_CANVAS_MARGIN = 1.12
+    ZOOM_RANGE = (0.92, 1.12)
+
+    def apply_dynamic_zoom(self, clip, zoom_plan, out_w, out_h):
+        import cv2
+        src_w, src_h = clip.size
+        margin = self.ZOOM_CANVAS_MARGIN
+        zmin, zmax = self.ZOOM_RANGE
+
+        def zoom_effect(get_frame, t):
+            frame = get_frame(t)
+            zoom  = 1.0
+            if zoom_plan:
+                contributions = []
+                for plan in zoom_plan:
+                    diff = abs(t - plan['time'])
+                    if diff < 4.0:
+                        smooth    = (1 + np.cos(np.pi * diff / 4.0)) / 2
+                        intensity = plan['intensity'] * smooth
+                        if plan['action'] == 'zoom_in':
+                            contributions.append(intensity)
+                        elif plan['action'] == 'zoom_out':
+                            contributions.append(-intensity)
+                if contributions:
+                    # Берём самый сильный отдельный импульс, а не сумму всех —
+                    # иначе близкие друг к другу точки зума складываются и
+                    # эффект получается куда резче, чем задумывался.
+                    zoom += max(contributions, key=abs)
+            zoom = max(zmin, min(zmax, zoom))
+
+            win_w = min(src_w, max(out_w, int(out_w * margin / zoom)))
+            win_h = min(src_h, max(out_h, int(out_h * margin / zoom)))
+            x1 = (src_w - win_w) // 2
+            y1 = (src_h - win_h) // 2
+            window = frame[y1:y1 + win_h, x1:x1 + win_w]
+
+            if win_w == out_w and win_h == out_h:
+                return window
+            return cv2.resize(window, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        return clip.transform(zoom_effect)
+
+    def _build_pil_font(self):
+        from PIL import ImageFont
+        fs   = FONT_SETTINGS
+        dirs = [
+            "C:/Windows/Fonts/", os.path.expanduser("~/.fonts/"),
+            "/usr/share/fonts/truetype/", "/usr/share/fonts/",
+            "/Library/Fonts/", os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ]
+        fam  = fs.font_family
+        flow = fam.lower().replace(" ", "")
+        variants = []
+        if fs.bold and fs.italic:
+            variants += [f"{fam} Bold Italic.ttf", f"{flow}bi.ttf", f"{flow}bolditalic.ttf"]
+        if fs.bold:
+            variants += [f"{fam} Bold.ttf", f"{fam}bd.ttf", f"{flow}bd.ttf",
+                         f"{flow}bold.ttf", f"{flow}-bold.ttf"]
+        if fs.italic:
+            variants += [f"{fam} Italic.ttf", f"{flow}i.ttf", f"{flow}italic.ttf"]
+        variants += [f"{fam}.ttf", f"{fam}.otf", f"{flow}.ttf",
+                     "arialbd.ttf", "arial.ttf", "impact.ttf",
+                     "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"]
+        for d in dirs:
+            for v in variants:
+                fp = os.path.join(d, v)
+                if os.path.exists(fp):
+                    try:
+                        return ImageFont.truetype(fp, fs.font_size)
+                    except Exception:
+                        continue
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _resize_to_cover(clip, target_w, target_h, margin=1.6):
+        """Один ресайз вместо двух последовательных (width, потом height) —
+        каждый лишний проход интерполяции теряет резкость."""
+        scale = max(target_w * margin / clip.w, target_h * margin / clip.h)
+        return clip.resized(scale)
+
+    @staticmethod
+    def _make_video_folder(title: str) -> str:
+        """clips/<название видео>/ — своя папка на каждый обработанный видео-исходник,
+        чтобы клипы разных видео (особенно при пакетной обработке) не мешались в одной куче."""
+        safe = re.sub(r'[<>:"/\\|?*]', '', (title or '').strip())[:80]
+        if not safe:
+            safe = f"video_{int(time.time())}"
+        if not os.path.exists(os.path.join(CLIPS_DIR, safe)):
+            return safe
+        n = 2
+        while os.path.exists(os.path.join(CLIPS_DIR, f"{safe} ({n})")):
+            n += 1
+        return f"{safe} ({n})"
+
+    def cut_and_caption(self, input_path, start, end, words,
+                        title=None, zoom_plan=None, hook_text=None,
+                        emotion_timeline=None, ffmpeg_threads=4, index=None):
+        output_dir = os.path.join(CLIPS_DIR, self.clip_subdir) if self.clip_subdir else CLIPS_DIR
+        os.makedirs(output_dir, exist_ok=True)
+        safe = re.sub(r'[<>:"/\\|?*]', '', title or f"clip_{int(start)}")[:60]
+        prefix = f"{index + 1:02d}_" if index is not None else ""
+        out  = os.path.join(output_dir, f"{prefix}{safe}.mp4")
+        self.log.emit("✂️ Нарезаю...")
+
+        clip = None
+        try:
+            clip = VideoFileClip(input_path).subclipped(start, end)
+            w_out, h_out = 1080, 1920
+            # Если зум включён, кадрируем с запасом ZOOM_CANVAS_MARGIN и отдаём этот запас
+            # под зум на этапе apply_dynamic_zoom — так зум всегда получается уменьшением
+            # (downscale), а не апскейлом уже финального кадра, откуда раньше бралось размытие.
+            zoom_margin = self.ZOOM_CANVAS_MARGIN if self.zoom_enabled else 1.0
+            crop_w, crop_h = int(w_out * zoom_margin), int(h_out * zoom_margin)
+
+            # ── Crop ──────────────────────────────────────────
+            # Один проход ресайза (вместо двух последовательных width→height) —
+            # каждый лишний проход интерполяции размывает картинку.
+            if self.face_crop_enabled:
+                self.log.emit("👤 Умный кроп...")
+                try:
+                    resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.6)
+                    clip = SmartFaceCrop(crop_w, crop_h, smoothing=0.97, max_step=8,
+                                        multi_speaker=self.multi_speaker_crop).make_transform(resized)
+                    self.log.emit("✅ Face crop!")
+                except Exception as e:
+                    self.log.emit(f"⚠️ Face crop: {e} → стандартный кроп")
+                    resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.5)
+                    clip = resized.cropped(x_center=resized.w/2, y_center=resized.h/2,
+                                          width=crop_w, height=crop_h)
+            else:
+                resized = self._resize_to_cover(clip, crop_w, crop_h, margin=1.5)
+                clip = resized.cropped(x_center=resized.w/2, y_center=resized.h/2,
+                                      width=crop_w, height=crop_h)
+
+            # ── Zoom (или просто финальный ресайз canvas → w_out×h_out) ─
+            if self.zoom_enabled:
+                self.log.emit("🎥 Зум...")
+                try:
+                    clip = self.apply_dynamic_zoom(clip, zoom_plan, w_out, h_out)
+                except Exception as e:
+                    self.log.emit(f"⚠️ Зум: {e}")
+                    clip = clip.resized((w_out, h_out))
+
+            # ── Subtitles ─────────────────────────────────────
+            self.log.emit("💬 Субтитры...")
+            subtitle_words = [
+                (ws - start, we - start, wt)
+                for ws, we, wt in [(w2['start'], w2['end'], w2['word']) for w2 in words]
+                if start <= ws <= end
+            ]
+            if subtitle_words:
+                fs2 = FONT_SETTINGS; wpf = fs2.words_per_phrase
+                groups, current = [], []
+                for ws, we, wt in subtitle_words:
+                    current.append((ws, we, wt))
+                    if len(current) >= wpf:
+                        groups.append(current); current = []
+                    elif we > (current[0][0] if current else 0) + 2.5 and current:
+                        groups.append(current); current = []
+                if current:
+                    groups.append(current)
+                self.log.emit(f"📝 {len(groups)} фраз | {fs2.font_family} {fs2.font_size}px")
+                try:
+                    font     = self._build_pil_font()
+                    renderer = SubtitleRenderer(font, fs2, w_out, h_out)
+                    emotion_color_map = {
+                        'happy':    (255, 220,  50),
+                        'surprise': (255, 165,   0),
+                        'fear':     (200, 100, 255),
+                        'angry':    (255,  80,  80),
+                        'sad':      (100, 150, 255),
+                        'disgust':  (150, 200, 100),
+                        'neutral':  tuple(fs2.text_color),
+                    }
+
+                    def get_emotion_color(t_abs):
+                        if not emotion_timeline:
+                            return tuple(fs2.text_color)
+                        closest = min(emotion_timeline,
+                                      key=lambda et2: abs(et2 - t_abs), default=None)
+                        return emotion_color_map.get(
+                            emotion_timeline.get(closest, 'neutral'),
+                            tuple(fs2.text_color)
+                        )
+
+                    groups_meta = [(g[0][0], g[-1][1], g) for g in groups]
+
+                    def add_subtitles(get_frame, t):
+                        frame = get_frame(t)
+                        group = next(
+                            (g for gs, ge, g in groups_meta if gs <= t <= ge), None
+                        )
+                        if not group:
+                            return frame
+                        tc = get_emotion_color(start + t)
+                        if fs2.karaoke_enabled:
+                            words_list = [wt for _, _, wt in group]
+                            active_idx = next(
+                                (i for i, (ws, we, _) in enumerate(group) if ws <= t <= we),
+                                len(words_list) - 1
+                            )
+                            overlay = renderer.get_karaoke_overlay(words_list, active_idx, tc)
+                        else:
+                            phrase  = " ".join(wt for _, _, wt in group)
+                            overlay = renderer.get_overlay(phrase, tc)
+                        return SubtitleRenderer.blend(frame, overlay)
+
+                    clip = clip.transform(add_subtitles)
+                    self.log.emit("✅ Субтитры!")
+                except Exception as e:
+                    self.log.emit(f"⚠️ Субтитры: {e}")
+                    import traceback; self.log.emit(traceback.format_exc())
+
+            # ── Hook ──────────────────────────────────────────
+            if hook_text and self.hook_enabled:
+                self.log.emit("🪝 Хук...")
+                try:
+                    clip = HookOverlay(hook_text, duration=3.0).apply(clip)
+                    self.log.emit("✅ Хук!")
+                except Exception as e:
+                    self.log.emit(f"⚠️ Хук: {e}")
+
+            # ── Export ────────────────────────────────────────
+            self.log.emit("💾 Сохраняю...")
+            clip.write_videofile(
+                out, codec="libx264", audio_codec="aac",
+                bitrate="10000k", audio_bitrate="192k",
+                preset="slow", fps=30, threads=ffmpeg_threads, logger=None,
+            )
+            clip.close(); gc.collect()
+            self.log.emit(f"✅ {safe}.mp4")
+            return out
+
+        finally:
+            if clip:
+                try: clip.close()
+                except Exception: pass
+            gc.collect()

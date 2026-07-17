@@ -1,0 +1,26 @@
+# Core
+PyQt6==6.11.0
+numpy==2.4.4
+Pillow==11.3.0
+yt-dlp==2026.3.17
+moviepy==2.2.1
+opencv-python==4.13.0.92
+scenedetect==0.7
+
+# Transcription / LLM
+faster-whisper==1.2.1
+llama-cpp-python==0.3.22
+
+# YouTube Data API v3
+google-api-python-client==2.196.0
+google-auth==2.52.0
+google-auth-oauthlib==1.4.0
+
+# Аудио-анализ (энергия/биты/паузы/смех) — используется скорингом виральности,
+# зумом по звуковым пикам и умной привязкой границ клипа. Без неё эти фичи
+# молча отключаются (0 точек), поэтому не помечаем как опциональную.
+librosa==0.11.0
+
+# Optional (best-effort, code degrades gracefully if missing):
+# mediapipe        -> face mesh / face detection (falls back to OpenCV Haar cascades)
+# vaderSentiment   -> sentiment scoring (falls back to a small keyword list)
