@@ -3,9 +3,10 @@ import re
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget, QInputDialog,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QSlider, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout,
+    QWidget, QInputDialog,
 )
 
 from .. import youtube
@@ -19,7 +20,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Reels Maker PRO")
-        self.setMinimumSize(860, 820)
+        self.setMinimumSize(900, 760)
         self._clips_result = []
         self._accounts      = []
         self._credentials   = None
@@ -56,6 +57,67 @@ class MainWindow(QMainWindow):
         self.auth_btn.clicked.connect(self.do_auth)
         ar.addWidget(self.auth_btn); layout.addLayout(ar)
         self._refresh_channel_combo()
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabBar::tab{padding:8px 16px;font-weight:bold;}
+            QTabWidget::pane{border:1px solid #444;border-radius:4px;}
+        """)
+        self.tabs.addTab(self._build_source_tab(), "🎬 Источник")
+        self.tabs.addTab(self._build_ai_format_tab(), "🤖 AI и формат")
+        self.tabs.addTab(self._build_subtitles_tab(), "🔤 Субтитры")
+        layout.addWidget(self.tabs)
+
+        self.start_btn = QPushButton("🎬 Создать клипы с AI обработкой")
+        self.start_btn.setStyleSheet("""
+            QPushButton{background:#4CAF50;color:white;padding:12px;font-size:14px;
+                border-radius:5px;font-weight:bold;}
+            QPushButton:hover{background:#45a049;}
+        """)
+        self.start_btn.clicked.connect(self.start_processing)
+        layout.addWidget(self.start_btn)
+
+        self.upload_btn = QPushButton("📤 Загрузить клипы на YouTube с расписанием")
+        self.upload_btn.setStyleSheet("""
+            QPushButton{background:#f44336;color:white;padding:12px;font-size:14px;
+                border-radius:5px;font-weight:bold;}
+            QPushButton:hover{background:#d32f2f;}
+        """)
+        self.upload_btn.clicked.connect(self.open_upload_dialog)
+        self.upload_btn.setVisible(False); layout.addWidget(self.upload_btn)
+
+        self.upload_from_folder_btn = QPushButton("📂 Загрузить готовые клипы из папки...")
+        self.upload_from_folder_btn.setToolTip(
+            "Выбрать любую папку с готовыми .mp4 (по умолчанию открывается clips) — "
+            "ищет и во вложенных подпапках"
+        )
+        self.upload_from_folder_btn.setStyleSheet("""
+            QPushButton{background:#7B1FA2;color:white;padding:10px;font-size:13px;
+                border-radius:5px;font-weight:bold;}
+            QPushButton:hover{background:#6A1B9A;}
+        """)
+        self.upload_from_folder_btn.clicked.connect(self.open_clips_folder_dialog)
+        layout.addWidget(self.upload_from_folder_btn)
+
+        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar{border:2px solid #ccc;border-radius:5px;
+                text-align:center;height:25px;}
+            QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #4CAF50,stop:1 #45a049);}
+        """)
+        layout.addWidget(self.progress_bar)
+
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
+        self.log_view.setMinimumHeight(160)
+        self.log_view.setStyleSheet(
+            "QTextEdit{background:#1e1e1e;color:#ddd;font-family:Consolas;"
+            "font-size:11px;padding:10px;border-radius:5px;}"
+        )
+        layout.addWidget(self.log_view)
+
+    def _build_source_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
 
         layout.addWidget(QLabel("🔗 YouTube URL или локальный файл:"))
         ur = QHBoxLayout()
@@ -103,8 +165,37 @@ class MainWindow(QMainWindow):
         cl2.addWidget(self.clip_count_spin); cg2.setLayout(cl2)
         sr3.addWidget(qg); sr3.addWidget(lg2); sr3.addWidget(dg2); sr3.addWidget(cg2)
         layout.addLayout(sr3)
+        layout.addStretch()
+        return tab
 
-        zg2 = QGroupBox("⚙️ Динамический зум"); zl2 = QVBoxLayout()
+    def _build_ai_format_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
+
+        fg = QGroupBox("🖼️ Формат кадра"); fl = QVBoxLayout()
+        self.format_normal_radio = QRadioButton("🎯 Обычный — умный кроп по лицу + зум")
+        self.format_normal_radio.setChecked(True)
+        self.format_centered_radio = QRadioButton("🖼️ По центру")
+        self.format_centered_radio.setToolTip(
+            "Видео вписывается в кадр целиком, без обрезки (contain-fit), и\n"
+            "центрируется на чёрном фоне. Кроп/зум/фокус на лицах не применяются.\n"
+            "Заголовок клипа держится сверху весь ролик."
+        )
+        self.format_split_radio = QRadioButton("📱 Split-screen")
+        self.format_split_radio.setToolTip(
+            "Видео кропается в верхнюю половину экрана, в нижнюю — случайный\n"
+            "отрезок фоновой нарезки (Subway Surfers/песок/т.п.) из папки\n"
+            "background_footage/. Положите туда свои файлы — .mp4/.mov/.mkv/.webm."
+        )
+        for rb in (self.format_normal_radio, self.format_centered_radio, self.format_split_radio):
+            rb.setStyleSheet("font-weight:bold;padding:3px;")
+            rb.toggled.connect(self._on_format_changed)
+            fl.addWidget(rb)
+        self.format_group = QButtonGroup(self)
+        for rb in (self.format_normal_radio, self.format_centered_radio, self.format_split_radio):
+            self.format_group.addButton(rb)
+        fg.setLayout(fl); layout.addWidget(fg)
+
+        zg2 = QGroupBox("⚙️ Динамический зум (только формат «Обычный»)"); zl2 = QVBoxLayout()
         self.zoom_enabled = QCheckBox("🎥 Включить зум")
         self.zoom_enabled.setChecked(True)
         self.zoom_enabled.setStyleSheet("font-weight:bold;")
@@ -118,6 +209,7 @@ class MainWindow(QMainWindow):
         ir2.addWidget(self.zoom_val); zl2.addLayout(ir2)
         zg2.setLayout(zl2); layout.addWidget(zg2)
         self.zoom_slider.valueChanged.connect(lambda v: self.zoom_val.setText(f"{v}%"))
+        self.zoom_group_box = zg2
 
         ag2 = QGroupBox("🤖 AI Улучшения"); al2 = QVBoxLayout()
         self.face_crop_cb = QCheckBox("👤 Умный кроп (MediaPipe) + плавное слежение")
@@ -132,21 +224,6 @@ class MainWindow(QMainWindow):
         self.multi_speaker_cb = QCheckBox("🗣️ Мультиспикерный кроп (переключение на говорящего)")
         self.multi_speaker_cb.setChecked(False)
         self.multi_speaker_cb.setStyleSheet("font-weight:bold;")
-        self.centered_layout_cb = QCheckBox(
-            "🖼️ Формат «по центру» (без кропа/зума, заголовок сверху, видео целиком по центру)"
-        )
-        self.centered_layout_cb.setChecked(False)
-        self.centered_layout_cb.setStyleSheet("font-weight:bold;")
-        self.split_screen_cb = QCheckBox(
-            "📱 Формат Split-screen (видео сверху, фоновая нарезка снизу — файлы в background_footage/)"
-        )
-        self.split_screen_cb.setChecked(False)
-        self.split_screen_cb.setStyleSheet("font-weight:bold;")
-        # Оба формата меняют композицию кадра целиком — включаем только один разом.
-        self.centered_layout_cb.toggled.connect(
-            lambda checked: checked and self.split_screen_cb.setChecked(False))
-        self.split_screen_cb.toggled.connect(
-            lambda checked: checked and self.centered_layout_cb.setChecked(False))
         emo_info = QLabel(
             "😊 Эмоции: MediaPipe Face Mesh (геометрия лица) + OpenCV Haar fallback\n"
             "   Зависимости: mediapipe, opencv-python — уже установлены"
@@ -161,10 +238,13 @@ class MainWindow(QMainWindow):
         info2.setWordWrap(True)
         al2.addWidget(self.face_crop_cb); al2.addWidget(self.hook_cb)
         al2.addWidget(self.virality_cb); al2.addWidget(self.multi_speaker_cb)
-        al2.addWidget(self.centered_layout_cb); al2.addWidget(self.split_screen_cb)
         al2.addWidget(emo_info); al2.addWidget(info2)
         ag2.setLayout(al2); layout.addWidget(ag2)
+        layout.addStretch()
+        return tab
 
+    def _build_subtitles_tab(self):
+        tab = QWidget(); layout = QVBoxLayout(tab)
         sg3 = QGroupBox("🔤 Субтитры"); sl4 = QHBoxLayout()
         self.font_preview = QLabel(); self._refresh_font_preview()
         self.font_preview.setMinimumWidth(220)
@@ -181,53 +261,17 @@ class MainWindow(QMainWindow):
         )
         fb2.clicked.connect(self.open_font_dialog)
         sl4.addWidget(fb2); sg3.setLayout(sl4); layout.addWidget(sg3)
+        layout.addStretch()
+        return tab
 
-        self.start_btn = QPushButton("🎬 Создать клипы с AI обработкой")
-        self.start_btn.setStyleSheet("""
-            QPushButton{background:#4CAF50;color:white;padding:12px;font-size:14px;
-                border-radius:5px;font-weight:bold;}
-            QPushButton:hover{background:#45a049;}
-        """)
-        self.start_btn.clicked.connect(self.start_processing)
-        layout.addWidget(self.start_btn)
-
-        self.upload_btn = QPushButton("📤 Загрузить клипы на YouTube с расписанием")
-        self.upload_btn.setStyleSheet("""
-            QPushButton{background:#f44336;color:white;padding:12px;font-size:14px;
-                border-radius:5px;font-weight:bold;}
-            QPushButton:hover{background:#d32f2f;}
-        """)
-        self.upload_btn.clicked.connect(self.open_upload_dialog)
-        self.upload_btn.setVisible(False); layout.addWidget(self.upload_btn)
-
-        self.upload_from_folder_btn = QPushButton("📂 Загрузить готовые клипы из папки...")
-        self.upload_from_folder_btn.setToolTip(
-            "Выбрать любую папку с готовыми .mp4 (по умолчанию открывается clips) — "
-            "ищет и во вложенных подпапках"
-        )
-        self.upload_from_folder_btn.setStyleSheet("""
-            QPushButton{background:#7B1FA2;color:white;padding:10px;font-size:13px;
-                border-radius:5px;font-weight:bold;}
-            QPushButton:hover{background:#6A1B9A;}
-        """)
-        self.upload_from_folder_btn.clicked.connect(self.open_clips_folder_dialog)
-        layout.addWidget(self.upload_from_folder_btn)
-
-        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar{border:2px solid #ccc;border-radius:5px;
-                text-align:center;height:25px;}
-            QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                stop:0 #4CAF50,stop:1 #45a049);}
-        """)
-        layout.addWidget(self.progress_bar)
-
-        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet(
-            "QTextEdit{background:#1e1e1e;color:#ddd;font-family:Consolas;"
-            "font-size:11px;padding:10px;border-radius:5px;}"
-        )
-        layout.addWidget(self.log_view)
+    def _on_format_changed(self):
+        """Кроп по лицу, мультиспикер и зум имеют смысл только в обычном формате —
+        в «по центру»/split-screen кадр строится иначе, эти настройки не участвуют."""
+        normal = self.format_normal_radio.isChecked()
+        for w in (self.face_crop_cb, self.multi_speaker_cb, self.zoom_group_box):
+            w.setEnabled(normal)
+        # Хук (мигающий 3 сек) заменяется постоянным заголовком только в «по центру».
+        self.hook_cb.setEnabled(not self.format_centered_radio.isChecked())
 
     def _refresh_font_preview(self):
         fs3 = FONT_SETTINGS; r, g, b = fs3.text_color
@@ -334,8 +378,8 @@ class MainWindow(QMainWindow):
             multi_speaker_crop=self.multi_speaker_cb.isChecked(),
             clip_count=self.clip_count_spin.value(),
             index_offset=index_offset,
-            centered_layout_enabled=self.centered_layout_cb.isChecked(),
-            split_screen_enabled=self.split_screen_cb.isChecked(),
+            centered_layout_enabled=self.format_centered_radio.isChecked(),
+            split_screen_enabled=self.format_split_radio.isChecked(),
         )
 
     def start_processing(self):

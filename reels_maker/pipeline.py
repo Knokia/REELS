@@ -91,6 +91,11 @@ class ProcessingThread(QThread):
     CANDIDATE_OVERHEAD = 8
     MAX_CANDIDATES = 25
     MIN_VIRALITY_SCORE = 0.25
+    # Ничто раньше не проверяло длину момента — LLM иногда предлагает (или
+    # scene-snap схлопывает до) момент в несколько секунд, особенно в быстро
+    # смонтированных заставках/тизерах в начале выпуска. Такой огрызок проходит
+    # дальше как валидный клип. Расширяем всё, что короче этого порога.
+    MIN_CLIP_DURATION = 15
 
     def __init__(self, url, quality, language, clip_duration,
                  zoom_enabled, zoom_intensity,
@@ -673,7 +678,31 @@ class ProcessingThread(QThread):
                     continue
                 valid.append({"start_time": s, "end_time": e, "reason": f"Авто {i+1}"})
             valid = self._dedupe_highlights(valid)
+
+        too_short = sum(1 for h in valid
+                        if h['end_time'] - h['start_time'] < self.MIN_CLIP_DURATION)
+        if too_short:
+            valid = [self._expand_to_min_duration(h, duration) for h in valid]
+            valid = self._dedupe_highlights(valid)
+            self.log.emit(
+                f"⏱️ Расширил {too_short} момент(ов) короче {self.MIN_CLIP_DURATION}с "
+                f"(попали в короткую сцену/склейку)"
+            )
         return sorted(valid[:count], key=lambda x: x['start_time'])
+
+    def _expand_to_min_duration(self, h: dict, duration: float) -> dict:
+        """Симметрично расширяет момент короче MIN_CLIP_DURATION вокруг его центра,
+        не вылезая за границы видео."""
+        st, et = h['start_time'], h['end_time']
+        cur = et - st
+        if cur >= self.MIN_CLIP_DURATION:
+            return h
+        need = self.MIN_CLIP_DURATION - cur
+        st2 = max(0.0, st - need / 2)
+        et2 = min(duration, st2 + self.MIN_CLIP_DURATION)
+        st2 = max(0.0, et2 - self.MIN_CLIP_DURATION)
+        h['start_time'], h['end_time'] = st2, et2
+        return h
 
     @staticmethod
     def _dedupe_highlights(highlights: list, overlap_ratio: float = 0.5) -> list:
