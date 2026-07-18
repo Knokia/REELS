@@ -328,7 +328,7 @@ class ProcessingThread(QThread):
             self.log.emit("\n=== ЛУЧШИЕ МОМЕНТЫ ==="); self.progress.emit(50)
             self._llm = self.load_llm()
             candidate_count = min(self.MAX_CANDIDATES, self.clip_count + self.CANDIDATE_OVERHEAD)
-            highlights = self.find_highlights(text, duration, scenes, count=candidate_count)
+            highlights = self.find_highlights(text, duration, scenes, words, count=candidate_count)
             self.log.emit(f"🔎 Кандидатов: {len(highlights)} (нужно клипов: {self.clip_count})")
             for h in highlights:
                 ws = h.get('start_time', 0); we = h.get('end_time', ws + 30)
@@ -614,33 +614,88 @@ class ProcessingThread(QThread):
             return text
         return self._llm.detokenize(tokens[:budget]).decode("utf-8", errors="ignore")
 
-    def find_highlights(self, text, duration, scenes, count=7):
-        self.log.emit("🤔 LLM...")
-        sc = "\n".join(
-            f"Сцена {i+1}: {s:.1f}s—{e:.1f}s" for i, (s, e) in enumerate(scenes[:50])
-        ) if scenes else ""
+    @staticmethod
+    def _words_to_timestamped_text(words, marker_interval=8.0):
+        """Вставляет метки времени вида [12.3s] через каждые marker_interval секунд.
+        Без них LLM не имеет вообще никакой привязки текста ко времени и вынуждена
+        линейно интерполировать start_time/end_time по положению в строке — это
+        сильно врёт, если в видео есть паузы, музыка или молчание. С метками модель
+        может просто прочитать нужное число рядом с интересующим её словом."""
+        if not words:
+            return ""
+        parts = []
+        last_marker = -marker_interval
+        for w in words:
+            if w['start'] - last_marker >= marker_interval:
+                parts.append(f"[{w['start']:.1f}s]")
+                last_marker = w['start']
+            parts.append(w['word'].strip())
+        return " ".join(parts)
 
-        def build_prompt(video_text):
+    def _chunk_words_by_context(self, words):
+        """Раньше весь транскрипт целиком обрезался до ~12000 токенов
+        (_fit_text_to_context брал только начало) — для длинного видео (часовой
+        эфир, стрим) LLM в принципе не видела вторую половину и не могла найти
+        там хайлайты. Вместо обрезки режем транскрипт на последовательные части
+        по бюджету контекста — каждая часть проходит через LLM отдельно, и в
+        сумме отсматривается всё видео целиком."""
+        if not words:
+            return [None]
+        full_text = self._words_to_timestamped_text(words)
+        total_tokens = len(self._llm.tokenize(full_text.encode("utf-8"), add_bos=False))
+        budget = self.MAX_PROMPT_TOKENS - 1500  # запас под сам промпт/инструкции/ответ
+        if total_tokens <= budget:
+            return [words]
+        n_chunks = -(-total_tokens // budget)  # ceil
+        chunk_size = -(-len(words) // n_chunks)  # ceil
+        return [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+
+    def _llm_propose_highlights(self, video_text, duration, scene_text, count):
+        def build_prompt(txt):
             return self._chat_prompt(
                 f"Найди {count} лучших моментов для Shorts "
-                f"(длина {duration:.0f}с, каждый ~{self.clip_duration}с±10с).\n"
-                f"{'Сцены:\n'+sc+chr(10) if sc else ''}"
-                f'Текст: "{video_text}"\n'
+                f"(общая длина видео {duration:.0f}с, каждый момент ~{self.clip_duration}с±10с).\n"
+                f"{'Сцены:\n'+scene_text+chr(10) if scene_text else ''}"
+                f"В тексте метки вида [12.3s] стоят перед словом, произнесённым в эту "
+                f"секунду — ориентируйся по ним, чтобы точно указать start_time и end_time.\n"
+                f'Текст: "{txt}"\n'
                 f'Ответь ТОЛЬКО валидным JSON без пояснений: '
                 f'[{{"start_time":число,"end_time":число,"reason":"..."}},...]'
             )
 
         max_tokens = 800
-        fitted_text = self._fit_text_to_context(text, build_prompt(""), max_tokens)
+        fitted_text = self._fit_text_to_context(video_text, build_prompt(""), max_tokens)
         prompt = build_prompt(fitted_text)
-        self.log.emit(f"📚 Контекст LLM: {len(fitted_text)}/{len(text)} символов транскрипта")
+        self.log.emit(f"📚 Контекст LLM: {len(fitted_text)}/{len(video_text)} символов")
         out = self._llm(prompt, max_tokens=max_tokens, temperature=0.7, stop=self.CHAT_STOP, echo=False)
         raw = out['choices'][0]['text']
         try:
             m = re.search(r'\[.*\]', raw, re.DOTALL)
-            highlights = json.loads(m.group()) if m else []
+            return json.loads(m.group()) if m else []
         except Exception:
-            highlights = []
+            return []
+
+    def find_highlights(self, text, duration, scenes, words, count=7):
+        self.log.emit("🤔 LLM...")
+        sc = "\n".join(
+            f"Сцена {i+1}: {s:.1f}s—{e:.1f}s" for i, (s, e) in enumerate(scenes[:50])
+        ) if scenes else ""
+
+        chunks = self._chunk_words_by_context(words)
+        if len(chunks) > 1:
+            self.log.emit(
+                f"📚 Транскрипт разбит на {len(chunks)} часте(й) — LLM пройдёт по всему "
+                f"видео, а не только по началу (раньше длинные видео обрезались)"
+            )
+
+        highlights = []
+        for i, chunk_words in enumerate(chunks):
+            chunk_text = self._words_to_timestamped_text(chunk_words) if chunk_words else text
+            raw = self._llm_propose_highlights(chunk_text, duration, sc, count)
+            highlights.extend(raw)
+            if len(chunks) > 1:
+                self.log.emit(f"   часть {i+1}/{len(chunks)}: {len(raw)} кандидат(ов)")
+
         valid = []
         if scenes:
             for h in highlights:
