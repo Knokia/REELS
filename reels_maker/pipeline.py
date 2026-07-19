@@ -1099,14 +1099,22 @@ class ProcessingThread(QThread):
 
             if self.centered_layout_enabled:
                 # Альтернативный формат: без кропа/зума/фокуса на лицах — исходник
-                # целиком вписывается в кадр (contain-fit) и центрируется на чёрном
-                # холсте, заголовок держится сверху весь ролик.
-                self.log.emit("🖼️ Формат «по центру» (без кропа/зума)...")
-                from moviepy import ColorClip, CompositeVideoClip
+                # целиком вписывается в кадр (contain-fit) и центрируется; сверху и
+                # снизу — не чёрные полосы, а размытая затемнённая растяжка того же
+                # кадра (cover-fit), похожая на тень/подложку, а не пустое поле.
+                self.log.emit("🖼️ Формат «по центру» (тень по краям)...")
+                from moviepy import CompositeVideoClip
                 scale  = min(w_out / clip.w, h_out / clip.h)
                 fitted = clip.resized(scale)
-                bg     = ColorClip(size=(w_out, h_out), color=(0, 0, 0), duration=clip.duration)
-                clip   = CompositeVideoClip([bg, fitted.with_position("center")], size=(w_out, h_out))
+
+                def blur_shadow(get_frame, t):
+                    import cv2
+                    frame = get_frame(t)
+                    blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=30)
+                    return (blurred.astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
+
+                bg = self._crop_to_fill(clip, w_out, h_out).transform(blur_shadow)
+                clip = CompositeVideoClip([bg, fitted.with_position("center")], size=(w_out, h_out))
                 if fitted.audio is not None:
                     clip = clip.with_audio(fitted.audio)
             elif self.split_screen_enabled:
