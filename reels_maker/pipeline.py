@@ -358,6 +358,7 @@ class ProcessingThread(QThread):
                 highlights = highlights[:self.clip_count]
 
             self.log.emit("\n🎯 Умная привязка границ...")
+            cut_fixed = 0
             for h in highlights:
                 for key in ('start_time', 'end_time'):
                     t2 = h[key]
@@ -368,6 +369,19 @@ class ProcessingThread(QThread):
                     h[key] = t2
                 if h['end_time'] - h['start_time'] < 5:
                     h['end_time'] = h['start_time'] + self.clip_duration
+
+                # Привязка выше — "мягкая" (снапает только если граница/пауза попала
+                # в узкий допуск в пару секунд); если рядом ничего не нашлось, время
+                # остаётся как есть и может упасть прямо внутрь слова. Это последний,
+                # безусловный рубеж: если так и произошло — дотягиваем/откатываем
+                # ровно до границы этого слова, чтобы клип не резал речь на полуслове.
+                new_end = min(self._extend_past_word(h['end_time'], words), duration)
+                new_start = max(self._retreat_to_word_start(h['start_time'], words), 0.0)
+                if new_end != h['end_time'] or new_start != h['start_time']:
+                    cut_fixed += 1
+                h['end_time'], h['start_time'] = new_end, new_start
+            if cut_fixed:
+                self.log.emit(f"✂️ Поправил {cut_fixed} границ(ы), резавших слово пополам")
 
             self.log.emit(f"\n=== ГЕНЕРАЦИЯ ЗАГОЛОВКОВ/ХУКОВ ({len(highlights)}) ===")
             render_jobs = []
@@ -758,6 +772,24 @@ class ProcessingThread(QThread):
         st2 = max(0.0, et2 - self.MIN_CLIP_DURATION)
         h['start_time'], h['end_time'] = st2, et2
         return h
+
+    @staticmethod
+    def _extend_past_word(t: float, words: list) -> float:
+        """Если t попадает строго внутрь произносимого слова — дотягивает до его
+        конца, а не обрезает его на середине."""
+        for w in words:
+            if w['start'] < t < w['end']:
+                return w['end']
+        return t
+
+    @staticmethod
+    def _retreat_to_word_start(t: float, words: list) -> float:
+        """Если t попадает строго внутрь произносимого слова — откатывает к его
+        началу, чтобы клип не начинался с середины слова."""
+        for w in words:
+            if w['start'] < t < w['end']:
+                return w['start']
+        return t
 
     @staticmethod
     def _dedupe_highlights(highlights: list, overlap_ratio: float = 0.5) -> list:
