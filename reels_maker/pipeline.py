@@ -157,17 +157,33 @@ class ProcessingThread(QThread):
         kwargs = dict(model_path=mp2, n_ctx=32768, n_threads=4, verbose=False)
         if match:
             kwargs['n_gpu_layers'] = 0
-        try:
-            return Llama(**kwargs)
-        except ValueError as e:
-            err = str(e)
-            if 'Failed to load model' in err and match:
-                base = pat.sub('.gguf', os.path.basename(mp2))
-                bp   = os.path.join(os.path.dirname(mp2), base)
-                if os.path.exists(bp):
-                    kwargs['model_path'] = bp
-                    return Llama(**kwargs)
-            raise
+
+        def _try_load(kw):
+            try:
+                return Llama(**kw)
+            except ValueError as e:
+                err = str(e)
+                if 'Failed to load model' in err and match:
+                    base = pat.sub('.gguf', os.path.basename(kw['model_path']))
+                    bp   = os.path.join(os.path.dirname(kw['model_path']), base)
+                    if os.path.exists(bp):
+                        kw = dict(kw, model_path=bp)
+                        return Llama(**kw)
+                raise
+
+        # Сначала пробуем целиком выгрузить модель на GPU (Q6_K 7B ≈ 6.3 ГБ,
+        # в 12 ГБ VRAM помещается вместе с KV-кэшем; Whisper к этому моменту
+        # уже выгружен) — инференс на порядок быстрее CPU. Если сборка
+        # llama-cpp-python без CUDA или VRAM не хватило — тихо откатываемся
+        # на прежний CPU-режим, чтобы обработка не ломалась.
+        if not match:
+            try:
+                llm = _try_load(dict(kwargs, n_gpu_layers=-1))
+                self.log.emit("⚡ LLM на GPU")
+                return llm
+            except Exception as e:
+                self.log.emit(f"⚠️ GPU для LLM недоступен ({e}) — работаю на CPU")
+        return _try_load(kwargs)
 
     # ── Transcript cache ──────────────────────────────────────
 

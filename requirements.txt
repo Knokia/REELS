@@ -9,7 +9,13 @@ scenedetect==0.7
 
 # Transcription / LLM
 faster-whisper==1.2.1
-llama-cpp-python==0.3.22
+# CUDA-сборка (GPU-инференс, ~15-40x быстрее CPU). py3-none wheel — не привязана
+# к версии Python. Требует NVIDIA-драйвер с поддержкой CUDA 13.x; на машине без
+# него можно поставить обычную CPU-версию: pip install llama-cpp-python==0.3.34
+llama_cpp_python @ https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.34-cu132/llama_cpp_python-0.3.34-py3-none-win_amd64.whl
+# cuBLAS/cuDNN для faster-whisper (ctranslate2 собран под CUDA 12.x)
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
 
 # YouTube Data API v3
 google-api-python-client==2.196.0
