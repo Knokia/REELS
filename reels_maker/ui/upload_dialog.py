@@ -1,4 +1,4 @@
-from PyQt6.QtCore import QDate, Qt, QTime, QTimer, QUrl
+from PyQt6.QtCore import QDate, QDateTime, Qt, QTime, QTimer, QUrl
 from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHBoxLayout, QHeaderView,
@@ -239,9 +239,20 @@ class UploadScheduleDialog(QDialog):
             if not self.table.cellWidget(row, COL_UPLOAD).isChecked():
                 continue
             is_sched   = self.table.cellWidget(row, COL_SCHEDULE).isChecked()
-            date_str   = self.table.cellWidget(row, COL_DATE).date().toString("yyyy-MM-dd")
-            time_str   = self.table.cellWidget(row, COL_TIME).time().toString("HH:mm")
-            publish_at = f"{date_str}T{time_str}:00+00:00" if is_sched else None
+            if is_sched:
+                # Дата/время в таблице — локальное время пользователя, а YouTube
+                # (publishAt) ожидает UTC. Раньше к введённому времени просто
+                # приклеивался "+00:00", то есть 10:00 по Москве уходило в API
+                # как "10:00 UTC" и YouTube показывал/публиковал в 13:00 по
+                # Москве. Явно конвертируем локальное время в UTC через Qt.
+                local_dt = QDateTime(
+                    self.table.cellWidget(row, COL_DATE).date(),
+                    self.table.cellWidget(row, COL_TIME).time(),
+                    Qt.TimeSpec.LocalTime,
+                )
+                publish_at = local_dt.toUTC().toString("yyyy-MM-ddTHH:mm:ss") + "Z"
+            else:
+                publish_at = None
             privacy    = "private" if is_sched else self.table.cellWidget(row, COL_PRIVACY).currentText()
             configs.append({
                 "clip":          self.clips[row],
