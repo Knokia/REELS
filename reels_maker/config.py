@@ -11,6 +11,11 @@ TRANSCRIPT_CACHE_DIR = os.path.join(CACHE_DIR, "transcripts")
 BACKGROUND_FOOTAGE_DIR = os.path.join(BASE_DIR, "background_footage")
 os.makedirs(BACKGROUND_FOOTAGE_DIR, exist_ok=True)
 
+# Логи запусков (logs/run_*.txt) — то же, что видно в окне приложения,
+# но сохраняется на диск и переживает закрытие окна.
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.ini")
+
 def _resolve_ffmpeg() -> str:
     # Бандл-версия ffmpeg.exe в корне проекта требует системных DLL (swscale и др.),
     # которых может не быть — используем самодостаточный бинарник из imageio-ffmpeg

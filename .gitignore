@@ -19,6 +19,8 @@ clips/
 temp_processing/
 cache/
 background_footage/
+logs/
+settings.ini
 
 # Models (too large for git — download separately)
 models/

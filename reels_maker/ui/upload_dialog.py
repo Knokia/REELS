@@ -231,7 +231,13 @@ class UploadScheduleDialog(QDialog):
 
     # ── Upload ────────────────────────────────────────────────
 
-    def _log(self, text): self.log_view.append(text)
+    def _log(self, text):
+        self.log_view.append(text)
+        # Дублируем в файловый лог главного окна, чтобы история загрузок
+        # на YouTube тоже сохранялась в logs/run_*.txt.
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "session_log"):
+            parent.session_log.write(f"[upload] {text}")
 
     def _start_upload(self):
         configs = []

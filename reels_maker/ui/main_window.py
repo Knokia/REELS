@@ -1,7 +1,7 @@
 import os
 import re
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import youtube
-from ..config import CLIPS_DIR, FONT_SETTINGS
+from ..config import CLIPS_DIR, FONT_SETTINGS, SETTINGS_PATH
 from ..pipeline import ProcessingThread
+from ..session_log import SessionLog
 from .font_dialog import FontSettingsDialog
 from .upload_dialog import UploadScheduleDialog
 
@@ -27,7 +28,73 @@ class MainWindow(QMainWindow):
         self._batch_queue  = []
         self._batch_total  = 0
         self._batch_index  = 0
+        self.session_log = SessionLog()
         self.setup_ui()
+        self._load_settings()
+
+    def _log(self, text: str):
+        """Единая точка логирования: в окно и в файл logs/run_*.txt."""
+        self.log_view.append(text)
+        self.session_log.write(text)
+
+    def closeEvent(self, event):
+        self._save_settings()
+        self.session_log.close()
+        super().closeEvent(event)
+
+    # ── Сохранение настроек между запусками ────────────────────
+
+    def _settings(self):
+        return QSettings(SETTINGS_PATH, QSettings.Format.IniFormat)
+
+    def _save_settings(self):
+        s = self._settings()
+        s.setValue("quality",       self.quality_combo.currentText())
+        s.setValue("language",      self.lang_combo.currentText())
+        s.setValue("duration",      self.duration_spin.value())
+        s.setValue("clip_count",    self.clip_count_spin.value())
+        s.setValue("zoom_enabled",  self.zoom_enabled.isChecked())
+        s.setValue("zoom_value",    self.zoom_slider.value())
+        s.setValue("face_crop",     self.face_crop_cb.isChecked())
+        s.setValue("hook",          self.hook_cb.isChecked())
+        s.setValue("virality",      self.virality_cb.isChecked())
+        s.setValue("multi_speaker", self.multi_speaker_cb.isChecked())
+        if self.format_centered_radio.isChecked():
+            fmt = "centered"
+        elif self.format_split_radio.isChecked():
+            fmt = "split"
+        else:
+            fmt = "normal"
+        s.setValue("frame_format", fmt)
+        s.setValue("tab_index",    self.tabs.currentIndex())
+        s.setValue("geometry",     self.saveGeometry())
+        if 0 <= self.channel_combo.currentIndex() < len(self._accounts):
+            s.setValue("channel_id", self._accounts[self.channel_combo.currentIndex()]["channel_id"])
+
+    def _load_settings(self):
+        s = self._settings()
+        if s.value("quality"):
+            self.quality_combo.setCurrentText(s.value("quality"))
+        if s.value("language"):
+            self.lang_combo.setCurrentText(s.value("language"))
+        self.duration_spin.setValue(s.value("duration", 30, int))
+        self.clip_count_spin.setValue(s.value("clip_count", 7, int))
+        self.zoom_enabled.setChecked(s.value("zoom_enabled", True, bool))
+        self.zoom_slider.setValue(s.value("zoom_value", 40, int))
+        self.face_crop_cb.setChecked(s.value("face_crop", True, bool))
+        self.hook_cb.setChecked(s.value("hook", True, bool))
+        self.virality_cb.setChecked(s.value("virality", True, bool))
+        self.multi_speaker_cb.setChecked(s.value("multi_speaker", False, bool))
+        fmt = s.value("frame_format", "normal")
+        {"centered": self.format_centered_radio,
+         "split":    self.format_split_radio}.get(fmt, self.format_normal_radio).setChecked(True)
+        self.tabs.setCurrentIndex(s.value("tab_index", 0, int))
+        geo = s.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        channel_id = s.value("channel_id")
+        if channel_id:
+            self._refresh_channel_combo(select_channel_id=channel_id)
 
     def setup_ui(self):
         central = QWidget(); self.setCentralWidget(central)
@@ -291,7 +358,7 @@ class MainWindow(QMainWindow):
         dlg = FontSettingsDialog(self)
         if dlg.exec():
             self._refresh_font_preview()
-            self.log_view.append(
+            self._log(
                 f"✅ Шрифт: {FONT_SETTINGS.font_family} {FONT_SETTINGS.font_size}px"
                 + (" Bold" if FONT_SETTINGS.bold else "")
                 + (" Italic" if FONT_SETTINGS.italic else "")
@@ -304,7 +371,7 @@ class MainWindow(QMainWindow):
         )
         if fp:
             self.url_input.setText(fp)
-            self.log_view.append(f"✅ {os.path.basename(fp)}")
+            self._log(f"✅ {os.path.basename(fp)}")
 
     def browse_files_batch(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -327,7 +394,7 @@ class MainWindow(QMainWindow):
                 client_id, client_secret = cid, csec
             result = youtube.add_account(client_id, client_secret)
             self._refresh_channel_combo(select_channel_id=result["channel_id"])
-            self.log_view.append(f"✅ Канал добавлен: {result['title']}")
+            self._log(f"✅ Канал добавлен: {result['title']}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка авторизации", str(e))
 
@@ -385,14 +452,14 @@ class MainWindow(QMainWindow):
     def start_processing(self):
         url = self.url_input.text().strip()
         if not url:
-            self.log_view.append("❌ Вставьте URL или выберите файл"); return
+            self._log("❌ Вставьте URL или выберите файл"); return
         if not url.startswith('http') and not os.path.isfile(url):
-            self.log_view.append(f"❌ Файл не найден: {url}"); return
+            self._log(f"❌ Файл не найден: {url}"); return
         self.log_view.clear()
         self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False); self.upload_btn.setVisible(False)
         self.thread = self._build_thread(url)
-        self.thread.log.connect(self.log_view.append)
+        self.thread.log.connect(self._log)
         self.thread.progress.connect(self.progress_bar.setValue)
         self.thread.finished.connect(self.on_finished)
         self.thread.start()
@@ -400,7 +467,7 @@ class MainWindow(QMainWindow):
     def on_finished(self, clips):
         self.start_btn.setEnabled(True); self._clips_result = clips
         if clips:
-            self.log_view.append(f"\n🎉 Клипов: {len(clips)}")
+            self._log(f"\n🎉 Клипов: {len(clips)}")
             self.upload_btn.setVisible(True)
             try: os.startfile(CLIPS_DIR)
             except Exception: pass
@@ -413,7 +480,7 @@ class MainWindow(QMainWindow):
         self._batch_index  = 0
         self._clips_result = []
         self.log_view.clear()
-        self.log_view.append(f"📦 Пакетная обработка: {self._batch_total} файл(ов)")
+        self._log(f"📦 Пакетная обработка: {self._batch_total} файл(ов)")
         self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False); self.upload_btn.setVisible(False)
         self._run_next_in_batch()
@@ -422,21 +489,21 @@ class MainWindow(QMainWindow):
         if self._batch_index >= self._batch_total:
             self.start_btn.setEnabled(True)
             if self._clips_result:
-                self.log_view.append(f"\n🎉🎉 Пакет завершён. Всего клипов: {len(self._clips_result)}")
+                self._log(f"\n🎉🎉 Пакет завершён. Всего клипов: {len(self._clips_result)}")
                 self.upload_btn.setVisible(True)
                 try: os.startfile(CLIPS_DIR)
                 except Exception: pass
             else:
-                self.log_view.append("\n⚠️ Пакет завершён, но клипов не получилось.")
+                self._log("\n⚠️ Пакет завершён, но клипов не получилось.")
             return
 
         fp = self._batch_queue[self._batch_index]
         self._batch_index += 1
-        self.log_view.append(
+        self._log(
             f"\n\n=== 📁 Файл {self._batch_index}/{self._batch_total}: {os.path.basename(fp)} ==="
         )
         self.thread = self._build_thread(fp)
-        self.thread.log.connect(self.log_view.append)
+        self.thread.log.connect(self._log)
         self.thread.progress.connect(self._on_batch_progress)
         self.thread.finished.connect(self._on_batch_file_finished)
         self.thread.start()
