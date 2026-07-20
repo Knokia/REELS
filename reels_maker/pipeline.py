@@ -738,17 +738,45 @@ class ProcessingThread(QThread):
                 f'[{{"start_time":число,"end_time":число,"reason":"..."}},...]'
             )
 
-        max_tokens = 800
+        # Модель регулярно "не слушается" запрошенного count и выдаёт заметно
+        # больше объектов (наблюдал 19-26 вместо запрошенных 15) — при 800
+        # токенах на вывод это иногда обрезает JSON-массив до закрывающей ']',
+        # и он целиком терялся (весь чанк давал 0 кандидатов). Увеличенный
+        # запас снижает частоту обрыва, а _parse_highlights_json ниже —
+        # подстраховка на случай, если он всё равно случится.
+        max_tokens = 1600
         fitted_text = self._fit_text_to_context(video_text, build_prompt(""), max_tokens)
         prompt = build_prompt(fitted_text)
         self.log.emit(f"📚 Контекст LLM: {len(fitted_text)}/{len(video_text)} символов")
         out = self._llm(prompt, max_tokens=max_tokens, temperature=0.7, stop=self.CHAT_STOP, echo=False)
         raw = out['choices'][0]['text']
-        try:
-            m = re.search(r'\[.*\]', raw, re.DOTALL)
-            return json.loads(m.group()) if m else []
-        except Exception:
-            return []
+        finish = out['choices'][0].get('finish_reason')
+        items = self._parse_highlights_json(raw)
+        if finish == 'length' and items:
+            self.log.emit(
+                f"⚠️ Ответ LLM обрезан по лимиту токенов — спасено {len(items)} "
+                f"момент(ов) из частично оборванного JSON"
+            )
+        return items
+
+    @staticmethod
+    def _parse_highlights_json(raw: str) -> list:
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
+        # Массив не закрылся (ответ обрезан по max_tokens до конца генерации) —
+        # вместо того чтобы терять все кандидаты чанка, вытаскиваем по отдельности
+        # уже полностью сформированные объекты {...} до места обрыва.
+        items = []
+        for obj in re.finditer(r'\{[^{}]*\}', raw, re.DOTALL):
+            try:
+                items.append(json.loads(obj.group()))
+            except Exception:
+                continue
+        return items
 
     def find_highlights(self, text, duration, scenes, words, count=7):
         self.log.emit("🤔 LLM...")
