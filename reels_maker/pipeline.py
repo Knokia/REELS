@@ -101,7 +101,8 @@ class ProcessingThread(QThread):
                  zoom_enabled, zoom_intensity,
                  face_crop_enabled=True, hook_enabled=True, virality_enabled=True,
                  multi_speaker_crop=False, clip_count=7, index_offset=0,
-                 centered_layout_enabled=False, split_screen_enabled=False):
+                 centered_layout_enabled=False, split_screen_enabled=False,
+                 compilation_enabled=False):
         super().__init__()
         self.url               = url
         self.quality           = quality
@@ -131,6 +132,9 @@ class ProcessingThread(QThread):
         # Split-screen: исходник в верхней половине, фоновая "нарезка"
         # (Subway Surfers/песок/т.п. из BACKGROUND_FOOTAGE_DIR) — в нижней.
         self.split_screen_enabled    = split_screen_enabled
+        # Компиляция: вместо вертикальных Shorts-клипов найденные моменты
+        # склеиваются в одно длинное горизонтальное 16:9 видео (см. compilation.py).
+        self.compilation_enabled     = compilation_enabled
         # Заголовки, уже сгенерированные в этом прогоне — подсказываем модели
         # их не повторять, иначе все клипы одного видео скатываются в один шаблон.
         self._generated_titles  = []
@@ -405,14 +409,55 @@ class ProcessingThread(QThread):
                 self.progress.emit(55 + int(i / len(highlights) * 10))
                 clip_title = self.generate_clip_title(text, h, words)
                 self.log.emit(f"📛 {i}/{len(highlights)}: {clip_title}")
-                hook_text = self.generate_hook(text, h, words) if self.hook_enabled else None
+                # Хук и зум нужны только вертикальным Shorts-клипам —
+                # в компиляции сегменты идут без них.
+                hook_text = (self.generate_hook(text, h, words)
+                             if self.hook_enabled and not self.compilation_enabled else None)
                 zoom_plan = (self.analyze_zoom_points(text, h, words, audio_energies)
-                             if self.zoom_enabled else None)
+                             if self.zoom_enabled and not self.compilation_enabled else None)
                 render_jobs.append({'highlight': h, 'title': clip_title,
                                      'hook_text': hook_text, 'zoom_plan': zoom_plan})
 
             # LLM больше не нужен — освобождаем память перед параллельным рендером
             del self._llm; self._llm = None; gc.collect()
+
+            if self.compilation_enabled:
+                # Режим «Компиляция»: одно длинное 16:9 видео вместо вертикальных
+                # клипов. Дальнейший Shorts-рендер полностью пропускается.
+                from .compilation import build_compilation
+                self.log.emit(f"\n=== КОМПИЛЯЦИЯ ({len(render_jobs)} сегментов) ===")
+                output_dir = (os.path.join(CLIPS_DIR, self.clip_subdir)
+                              if self.clip_subdir else CLIPS_DIR)
+                os.makedirs(output_dir, exist_ok=True)
+                comp_path = build_compilation(
+                    video_path, render_jobs, output_dir,
+                    self.video_title or f"video_{int(time.time())}",
+                    ffmpeg_threads=max(1, os.cpu_count() or 4),
+                    log_cb=self.log.emit,
+                    progress_cb=lambda p: self.progress.emit(65 + int(p * 100)),
+                )
+                with VideoFileClip(comp_path) as _c:
+                    comp_dur = _c.duration
+                output_clips = [{
+                    'path': comp_path,
+                    'title': f"Компиляция — {self.video_title or ''}".strip(" —"),
+                    'filename': os.path.basename(comp_path),
+                    'start': 0.0, 'end': comp_dur, 'duration': comp_dur,
+                    'reason': 'compilation',
+                    'virality_score': max((j['highlight'].get('virality_score', 0.0)
+                                           for j in render_jobs), default=0.0),
+                    'hook': '',
+                }]
+                self.progress.emit(100)
+                self.log.emit(f"\n✅ Компиляция готова: {comp_dur / 60:.1f} мин")
+                EmotionDetector.cleanup()
+                try:
+                    gc.collect(); time.sleep(1)
+                    shutil.rmtree(WORK_DIR, ignore_errors=True)
+                except Exception:
+                    pass
+                self.finished.emit(output_clips)
+                return
 
             workers = max(1, min(3, (os.cpu_count() or 2) // 2))
             ffmpeg_threads = max(1, (os.cpu_count() or 4) // workers)

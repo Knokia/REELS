@@ -66,6 +66,8 @@ class MainWindow(QMainWindow):
         else:
             fmt = "normal"
         s.setValue("frame_format", fmt)
+        s.setValue("output_type",
+                   "compilation" if self.output_compilation_radio.isChecked() else "shorts")
         s.setValue("tab_index",    self.tabs.currentIndex())
         s.setValue("geometry",     self.saveGeometry())
         if 0 <= self.channel_combo.currentIndex() < len(self._accounts):
@@ -88,6 +90,8 @@ class MainWindow(QMainWindow):
         fmt = s.value("frame_format", "normal")
         {"centered": self.format_centered_radio,
          "split":    self.format_split_radio}.get(fmt, self.format_normal_radio).setChecked(True)
+        if s.value("output_type", "shorts") == "compilation":
+            self.output_compilation_radio.setChecked(True)
         self.tabs.setCurrentIndex(s.value("tab_index", 0, int))
         geo = s.value("geometry")
         if geo is not None:
@@ -238,6 +242,27 @@ class MainWindow(QMainWindow):
     def _build_ai_format_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
 
+        og = QGroupBox("🎞️ Тип результата"); ol = QVBoxLayout()
+        self.output_shorts_radio = QRadioButton("📱 Shorts — вертикальные клипы 9:16 (как обычно)")
+        self.output_shorts_radio.setChecked(True)
+        self.output_compilation_radio = QRadioButton(
+            "🎬 Компиляция — одно длинное горизонтальное видео 16:9"
+        )
+        self.output_compilation_radio.setToolTip(
+            "Найденные моменты склеиваются в хронологическом порядке в одно\n"
+            "видео 1920x1080 с плашкой-названием в начале каждого сегмента.\n"
+            "Кроп/зум/хук/субтитры Shorts не применяются. Для 8+ минут\n"
+            "на YouTube доступны mid-roll рекламные вставки."
+        )
+        for rb in (self.output_shorts_radio, self.output_compilation_radio):
+            rb.setStyleSheet("font-weight:bold;padding:3px;")
+            rb.toggled.connect(self._on_output_type_changed)
+            ol.addWidget(rb)
+        self.output_type_group = QButtonGroup(self)
+        self.output_type_group.addButton(self.output_shorts_radio)
+        self.output_type_group.addButton(self.output_compilation_radio)
+        og.setLayout(ol); layout.addWidget(og)
+
         fg = QGroupBox("🖼️ Формат кадра"); fl = QVBoxLayout()
         self.format_normal_radio = QRadioButton("🎯 Обычный — умный кроп по лицу + зум")
         self.format_normal_radio.setChecked(True)
@@ -261,6 +286,7 @@ class MainWindow(QMainWindow):
         for rb in (self.format_normal_radio, self.format_centered_radio, self.format_split_radio):
             self.format_group.addButton(rb)
         fg.setLayout(fl); layout.addWidget(fg)
+        self.format_group_box = fg
 
         zg2 = QGroupBox("⚙️ Динамический зум (только формат «Обычный»)"); zl2 = QVBoxLayout()
         self.zoom_enabled = QCheckBox("🎥 Включить зум")
@@ -334,11 +360,25 @@ class MainWindow(QMainWindow):
     def _on_format_changed(self):
         """Кроп по лицу, мультиспикер и зум имеют смысл только в обычном формате —
         в «по центру»/split-screen кадр строится иначе, эти настройки не участвуют."""
+        if self.output_compilation_radio.isChecked():
+            return  # в режиме компиляции всё уже заблокировано _on_output_type_changed
         normal = self.format_normal_radio.isChecked()
         for w in (self.face_crop_cb, self.multi_speaker_cb, self.zoom_group_box):
             w.setEnabled(normal)
         # Хук (мигающий 3 сек) заменяется постоянным заголовком только в «по центру».
         self.hook_cb.setEnabled(not self.format_centered_radio.isChecked())
+
+    def _on_output_type_changed(self):
+        """В режиме «Компиляция» кадр не перекраивается в вертикаль — формат кадра,
+        кроп, зум и хук не участвуют вовсе."""
+        shorts = self.output_shorts_radio.isChecked()
+        self.format_group_box.setEnabled(shorts)
+        if shorts:
+            self._on_format_changed()
+        else:
+            for w in (self.face_crop_cb, self.multi_speaker_cb,
+                      self.zoom_group_box, self.hook_cb):
+                w.setEnabled(False)
 
     def _refresh_font_preview(self):
         fs3 = FONT_SETTINGS; r, g, b = fs3.text_color
@@ -447,6 +487,7 @@ class MainWindow(QMainWindow):
             index_offset=index_offset,
             centered_layout_enabled=self.format_centered_radio.isChecked(),
             split_screen_enabled=self.format_split_radio.isChecked(),
+            compilation_enabled=self.output_compilation_radio.isChecked(),
         )
 
     def start_processing(self):
