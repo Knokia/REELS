@@ -70,7 +70,11 @@ def build_compilation(video_path: str, render_jobs: list, output_dir: str,
     """Склеивает сегменты (по одному на каждый найденный момент, в хронологии)
     в одно 16:9 видео с плашкой-названием в начале каждого сегмента."""
     log = log_cb or (lambda *_: None)
-    safe = re.sub(r'[<>:"/\\|?*]', '', comp_title).strip()[:70] or "compilation"
+    # .strip(' .') ПОСЛЕ обрезки длины, не только до неё — срез по [:70] может
+    # оставить пробел на конце, а Windows тихо режет такой пробел у реального
+    # файла на диске, из-за чего ffmpeg потом не находит путь, который построил
+    # Python (см. тот же фикс в pipeline.py _make_video_folder/cut_and_caption).
+    safe = re.sub(r'[<>:"/\\|?*]', '', comp_title).strip()[:70].strip(' .') or "compilation"
     out_path = os.path.join(output_dir, f"Компиляция — {safe}.mp4")
 
     source = VideoFileClip(video_path)

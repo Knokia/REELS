@@ -1161,7 +1161,11 @@ class ProcessingThread(QThread):
     def _make_video_folder(title: str) -> str:
         """clips/<название видео>/ — своя папка на каждый обработанный видео-исходник,
         чтобы клипы разных видео (особенно при пакетной обработке) не мешались в одной куче."""
-        safe = re.sub(r'[<>:"/\\|?*]', '', (title or '').strip())[:80]
+        # .strip(' .') ПОСЛЕ обрезки длины, не только до неё — иначе срез по [:80]
+        # может оставить пробел на конце. Windows тихо обрезает такой пробел при
+        # создании самой папки на диске, но Python-строка его сохраняет — и ffmpeg
+        # потом не находит папку по чуть-чуть другому пути ("No such file or directory").
+        safe = re.sub(r'[<>:"/\\|?*]', '', (title or '').strip())[:80].strip(' .')
         if not safe:
             safe = f"video_{int(time.time())}"
         if not os.path.exists(os.path.join(CLIPS_DIR, safe)):
@@ -1176,7 +1180,7 @@ class ProcessingThread(QThread):
                         emotion_timeline=None, ffmpeg_threads=4, index=None):
         output_dir = os.path.join(CLIPS_DIR, self.clip_subdir) if self.clip_subdir else CLIPS_DIR
         os.makedirs(output_dir, exist_ok=True)
-        safe = re.sub(r'[<>:"/\\|?*]', '', title or f"clip_{int(start)}")[:60]
+        safe = re.sub(r'[<>:"/\\|?*]', '', title or f"clip_{int(start)}")[:60].strip(' .')
         prefix = f"{index + 1:02d}_" if index is not None else ""
         out  = os.path.join(output_dir, f"{prefix}{safe}.mp4")
         self.log.emit("✂️ Нарезаю...")
