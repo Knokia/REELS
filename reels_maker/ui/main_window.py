@@ -10,10 +10,12 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import youtube
+from ..compilation import CompilationMergeThread
 from ..config import CLIPS_DIR, FONT_SETTINGS, SETTINGS_PATH
 from ..pipeline import ProcessingThread
 from ..session_log import SessionLog
 from .font_dialog import FontSettingsDialog
+from .multi_source_dialog import MultiSourceDialog
 from .upload_dialog import UploadScheduleDialog
 
 
@@ -212,6 +214,19 @@ class MainWindow(QMainWindow):
         ur.addWidget(br5)
         layout.addLayout(ur)
 
+        self.multi_comp_btn = QPushButton("🎬 Компиляция из нескольких видео...")
+        self.multi_comp_btn.setToolTip(
+            "Только для типа результата «Компиляция»: выбрать несколько источников "
+            "(YouTube-ссылки и/или файлы) — моменты из всех склеятся в один ролик 16:9."
+        )
+        self.multi_comp_btn.setStyleSheet(
+            "QPushButton{background:#5E35B1;color:white;padding:8px 14px;border-radius:5px;font-weight:bold;}"
+            "QPushButton:hover{background:#4527A0;}"
+        )
+        self.multi_comp_btn.clicked.connect(self.browse_multi_compilation_sources)
+        self.multi_comp_btn.setVisible(False)  # видно только в режиме «Компиляция»
+        layout.addWidget(self.multi_comp_btn)
+
         sr3 = QHBoxLayout()
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["1080p", "720p", "480p", "360p"])
@@ -373,6 +388,7 @@ class MainWindow(QMainWindow):
         кроп, зум и хук не участвуют вовсе."""
         shorts = self.output_shorts_radio.isChecked()
         self.format_group_box.setEnabled(shorts)
+        self.multi_comp_btn.setVisible(not shorts)
         if shorts:
             self._on_format_changed()
         else:
@@ -557,6 +573,97 @@ class MainWindow(QMainWindow):
     def _on_batch_file_finished(self, clips):
         self._clips_result.extend(clips)
         self._run_next_in_batch()
+
+    # ── Компиляция из нескольких источников в одно видео 16:9 ──
+
+    def browse_multi_compilation_sources(self):
+        dlg = MultiSourceDialog(self)
+        if dlg.exec():
+            sources = dlg.sources()
+            if sources:
+                self.start_multi_compilation(sources)
+
+    def start_multi_compilation(self, sources: list):
+        self._multi_comp_queue = list(sources)
+        self._multi_comp_total = len(sources)
+        self._multi_comp_index = 0
+        self._multi_comp_jobs  = []
+        self.log_view.clear()
+        self._log(f"🎬 Компиляция из {self._multi_comp_total} источник(ов)")
+        self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
+        self.start_btn.setEnabled(False); self.upload_btn.setVisible(False)
+        self._run_next_multi_comp_source()
+
+    def _run_next_multi_comp_source(self):
+        if self._multi_comp_index >= self._multi_comp_total:
+            self._finish_multi_comp_collection()
+            return
+        src = self._multi_comp_queue[self._multi_comp_index]
+        self._multi_comp_index += 1
+        label = os.path.basename(src) if os.path.isfile(src) else src
+        self._log(
+            f"\n\n=== 📁 Источник {self._multi_comp_index}/{self._multi_comp_total}: {label} ==="
+        )
+        # work_subdir даёт каждому источнику свою рабочую папку — иначе видео
+        # следующего источника перезаписало бы ещё не склеенное видео предыдущего.
+        self.thread = ProcessingThread(
+            src,
+            self.quality_combo.currentText(),
+            self.lang_combo.currentText(),
+            self.duration_spin.value(),
+            self.zoom_enabled.isChecked(),
+            self.zoom_slider.value(),
+            clip_count=self.clip_count_spin.value(),
+            compilation_enabled=True,
+            work_subdir=f"multi_comp_{self._multi_comp_index}",
+            emit_jobs_only=True,
+        )
+        self.thread.log.connect(self._log)
+        self.thread.progress.connect(self._on_multi_comp_source_progress)
+        self.thread.jobs_ready.connect(self._on_multi_comp_source_ready)
+        self.thread.start()
+
+    def _on_multi_comp_source_progress(self, pct):
+        base = (self._multi_comp_index - 1) / self._multi_comp_total * 100
+        span = 100 / self._multi_comp_total
+        # Последние ~10% прогресс-бара оставляем под финальную склейку.
+        self.progress_bar.setValue(int((base + pct / 100 * span) * 0.9))
+
+    def _on_multi_comp_source_ready(self, data):
+        if data and data.get('render_jobs'):
+            self._multi_comp_jobs.append(data)
+        self._run_next_multi_comp_source()
+
+    def _finish_multi_comp_collection(self):
+        if not self._multi_comp_jobs:
+            self._log("\n⚠️ Не удалось собрать моменты ни из одного источника.")
+            self.start_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            return
+        total_moments = sum(len(d['render_jobs']) for d in self._multi_comp_jobs)
+        self._log(
+            f"\n=== СКЛЕЙКА: {len(self._multi_comp_jobs)} источник(ов), "
+            f"{total_moments} момент(ов) ==="
+        )
+        title = " + ".join(d['video_title'] or 'видео' for d in self._multi_comp_jobs)[:80]
+        self.merge_thread = CompilationMergeThread(self._multi_comp_jobs, CLIPS_DIR, title)
+        self.merge_thread.log.connect(self._log)
+        self.merge_thread.progress.connect(
+            lambda p: self.progress_bar.setValue(90 + int(p * 0.1)))
+        self.merge_thread.finished.connect(self._on_multi_comp_finished)
+        self.merge_thread.start()
+
+    def _on_multi_comp_finished(self, result):
+        self.start_btn.setEnabled(True)
+        if result:
+            self.progress_bar.setValue(100)
+            self._clips_result = [result]
+            self._log(f"\n🎉 Компиляция из {len(self._multi_comp_jobs)} видео готова!")
+            self.upload_btn.setVisible(True)
+            try: os.startfile(CLIPS_DIR)
+            except Exception: pass
+        else:
+            self._log("\n⚠️ Склейка не удалась.")
 
     def open_upload_dialog(self):
         if not self._credentials:

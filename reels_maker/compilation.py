@@ -8,6 +8,7 @@ import re
 import numpy as np
 from moviepy import ColorClip, CompositeVideoClip, VideoFileClip, concatenate_videoclips
 from PIL import Image, ImageDraw, ImageFont
+from PyQt6.QtCore import QThread, pyqtSignal
 
 from .subtitles import SubtitleRenderer
 
@@ -64,43 +65,74 @@ def _fit_1080p(clip):
     return out
 
 
-def build_compilation(video_path: str, render_jobs: list, output_dir: str,
-                      comp_title: str, ffmpeg_threads: int = 4,
-                      log_cb=None, progress_cb=None) -> str:
-    """Склеивает сегменты (по одному на каждый найденный момент, в хронологии)
-    в одно 16:9 видео с плашкой-названием в начале каждого сегмента."""
-    log = log_cb or (lambda *_: None)
+def _safe_filename(comp_title: str) -> str:
     # .strip(' .') ПОСЛЕ обрезки длины, не только до неё — срез по [:70] может
     # оставить пробел на конце, а Windows тихо режет такой пробел у реального
     # файла на диске, из-за чего ffmpeg потом не находит путь, который построил
     # Python (см. тот же фикс в pipeline.py _make_video_folder/cut_and_caption).
-    safe = re.sub(r'[<>:"/\\|?*]', '', comp_title).strip()[:70].strip(' .') or "compilation"
+    return re.sub(r'[<>:"/\\|?*]', '', comp_title).strip()[:70].strip(' .') or "compilation"
+
+
+def build_compilation(video_path: str, render_jobs: list, output_dir: str,
+                      comp_title: str, ffmpeg_threads: int = 4,
+                      log_cb=None, progress_cb=None) -> str:
+    """Склеивает сегменты одного видео в одно 16:9 видео с плашкой-названием
+    в начале каждого сегмента. Частный случай build_multi_compilation с одним
+    источником — оставлен отдельной функцией как более простой вход для
+    однo-видео пайплайна в pipeline.py."""
+    return build_multi_compilation(
+        [{'video_path': video_path, 'video_title': '', 'render_jobs': render_jobs}],
+        output_dir, comp_title, ffmpeg_threads=ffmpeg_threads,
+        log_cb=log_cb, progress_cb=progress_cb,
+    )
+
+
+def build_multi_compilation(sources: list, output_dir: str, comp_title: str,
+                            ffmpeg_threads: int = 4,
+                            log_cb=None, progress_cb=None) -> str:
+    """Как build_compilation, но склеивает сегменты сразу из нескольких видео
+    в один файл. sources — список {'video_path', 'video_title', 'render_jobs'},
+    источники идут в порядке списка, сегменты внутри каждого — хронологически."""
+    log = log_cb or (lambda *_: None)
+    safe = _safe_filename(comp_title)
     out_path = os.path.join(output_dir, f"Компиляция — {safe}.mp4")
 
-    source = VideoFileClip(video_path)
+    total = sum(len(src['render_jobs']) for src in sources)
+    if total == 0:
+        raise ValueError("Нет ни одного момента для компиляции")
+
+    opened = []
     segments = []
+    seg_i = 0
     try:
-        jobs = sorted(render_jobs, key=lambda j: j['highlight']['start_time'])
-        for i, job in enumerate(jobs, 1):
-            h = job['highlight']
-            seg = _fit_1080p(source.subclipped(h['start_time'], h['end_time']))
-            banner = _make_banner(f"{i}/{len(jobs)} · {job['title']}")
+        for src in sources:
+            source = VideoFileClip(src['video_path'])
+            opened.append(source)
+            jobs = sorted(src['render_jobs'], key=lambda j: j['highlight']['start_time'])
+            for job in jobs:
+                seg_i += 1
+                h = job['highlight']
+                seg = _fit_1080p(source.subclipped(h['start_time'], h['end_time']))
+                label = f"{seg_i}/{total} · {job['title']}"
+                if src.get('video_title'):
+                    label = f"{seg_i}/{total} · {src['video_title']}: {job['title']}"
+                banner = _make_banner(label)
 
-            def with_banner(get_frame, t, _banner=banner):
-                frame = get_frame(t)
-                if t <= BANNER_SECONDS:
-                    return SubtitleRenderer.blend(frame, _banner)
-                return frame
+                def with_banner(get_frame, t, _banner=banner):
+                    frame = get_frame(t)
+                    if t <= BANNER_SECONDS:
+                        return SubtitleRenderer.blend(frame, _banner)
+                    return frame
 
-            segments.append(seg.transform(with_banner))
-            log(f"   🧩 Сегмент {i}/{len(jobs)}: {job['title']} "
-                f"({h['end_time'] - h['start_time']:.0f}с)")
-            if progress_cb:
-                progress_cb(i / (len(jobs) + 1) * 0.3)
+                segments.append(seg.transform(with_banner))
+                log(f"   🧩 {label} ({h['end_time'] - h['start_time']:.0f}с)")
+                if progress_cb:
+                    progress_cb(seg_i / (total + 1) * 0.3)
 
         final = concatenate_videoclips(segments)
-        total = final.duration
-        log(f"💾 Рендер компиляции: {total / 60:.1f} мин, 1920x1080...")
+        dur = final.duration
+        log(f"💾 Рендер компиляции: {dur / 60:.1f} мин, 1920x1080, "
+            f"источников: {len(sources)}...")
         final.write_videofile(
             out_path, codec="libx264", audio_codec="aac",
             bitrate="8000k", audio_bitrate="192k",
@@ -108,5 +140,53 @@ def build_compilation(video_path: str, render_jobs: list, output_dir: str,
         )
         final.close()
     finally:
-        source.close()
+        for source in opened:
+            source.close()
     return out_path
+
+
+class CompilationMergeThread(QThread):
+    """Финальная склейка нескольких уже проанализированных источников в один
+    файл — вынесена в отдельный QThread, чтобы UI не подвисал во время рендера
+    (сборка идёт после того как ProcessingThread каждого источника уже собрал
+    свои render_jobs через emit_jobs_only=True)."""
+    log      = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object)
+
+    def __init__(self, sources: list, output_dir: str, comp_title: str):
+        super().__init__()
+        self.sources    = sources
+        self.output_dir = output_dir
+        self.comp_title = comp_title
+
+    def run(self):
+        try:
+            path = build_multi_compilation(
+                self.sources, self.output_dir, self.comp_title,
+                ffmpeg_threads=max(1, os.cpu_count() or 4),
+                log_cb=self.log.emit,
+                progress_cb=lambda p: self.progress.emit(int(p * 100)),
+            )
+            with VideoFileClip(path) as c:
+                dur = c.duration
+            self.finished.emit({
+                'path':           path,
+                'title':          f"Компиляция — {self.comp_title}",
+                'filename':       os.path.basename(path),
+                'start': 0.0, 'end': dur, 'duration': dur,
+                'reason':         'multi_compilation',
+                'virality_score': 0.0,
+                'hook':           '',
+            })
+        except Exception as e:
+            self.log.emit(f"❌ {e}")
+            import traceback; self.log.emit(traceback.format_exc())
+            self.finished.emit(None)
+        finally:
+            for src in self.sources:
+                try:
+                    import shutil
+                    shutil.rmtree(src['work_dir'], ignore_errors=True)
+                except Exception:
+                    pass

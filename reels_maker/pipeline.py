@@ -85,6 +85,10 @@ class ProcessingThread(QThread):
     log      = pyqtSignal(str)
     progress = pyqtSignal(int)
     finished = pyqtSignal(object)
+    # Испускается вместо finished, когда emit_jobs_only=True (сбор моментов для
+    # компиляции из нескольких видео — см. compile_multi.py) — вместо готового
+    # результата отдаёт сырые данные для дальнейшей склейки в MainWindow.
+    jobs_ready = pyqtSignal(dict)
 
     # Кандидатов для анализа всегда берём больше, чем нужно финальных клипов —
     # иначе скорингу виральности физически не из чего отсеивать слабые.
@@ -102,9 +106,18 @@ class ProcessingThread(QThread):
                  face_crop_enabled=True, hook_enabled=True, virality_enabled=True,
                  multi_speaker_crop=False, clip_count=7, index_offset=0,
                  centered_layout_enabled=False, split_screen_enabled=False,
-                 compilation_enabled=False):
+                 compilation_enabled=False, work_subdir=None, emit_jobs_only=False):
         super().__init__()
         self.url               = url
+        # Изолированная рабочая папка на источник — нужна, когда несколько
+        # ProcessingThread обрабатывают разные видео для одной мульти-компиляции
+        # одновременно/последовательно: общий WORK_DIR/video.mp4 иначе перезаписывался
+        # бы каждым следующим источником раньше, чем предыдущий успевал попасть в склейку.
+        self.work_dir = os.path.join(WORK_DIR, work_subdir) if work_subdir else WORK_DIR
+        # Только собрать (video_path, render_jobs, title) и отдать через jobs_ready,
+        # не рендеря готовый файл и не удаляя рабочую папку — использует внешний
+        # оркестратор (склейка нескольких источников в одну компиляцию).
+        self.emit_jobs_only    = emit_jobs_only
         self.quality           = quality
         self.language           = language
         self.clip_duration     = clip_duration
@@ -230,22 +243,22 @@ class ProcessingThread(QThread):
 
     def run(self):
         try:
-            os.makedirs(WORK_DIR, exist_ok=True)
+            os.makedirs(self.work_dir, exist_ok=True)
             is_local = os.path.isfile(self.url)
 
             if is_local:
                 self.log.emit("=== ЛОКАЛЬНЫЙ ФАЙЛ ===")
                 self.video_title = os.path.splitext(os.path.basename(self.url))[0]
-                video_path = os.path.join(WORK_DIR, "video.mp4")
+                video_path = os.path.join(self.work_dir, "video.mp4")
                 shutil.copy2(self.url, video_path)
                 self.progress.emit(20)
             else:
                 self.log.emit("=== СКАЧИВАЕМ С YOUTUBE ===")
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    video_path = os.path.join(WORK_DIR, "video.mp4")
+                    video_path = os.path.join(self.work_dir, "video.mp4")
                     shutil.copy2(self.download_youtube(tmpdir), video_path)
                     if self.srt_path and os.path.exists(self.srt_path):
-                        new_srt = os.path.join(WORK_DIR, "subtitles.srt")
+                        new_srt = os.path.join(self.work_dir, "subtitles.srt")
                         shutil.copy2(self.srt_path, new_srt)
                         self.srt_path = new_srt
 
@@ -422,6 +435,21 @@ class ProcessingThread(QThread):
             del self._llm; self._llm = None; gc.collect()
 
             if self.compilation_enabled:
+                if self.emit_jobs_only:
+                    # Это видео — один из нескольких источников для мульти-
+                    # компиляции; финальную склейку и очистку work_dir делает
+                    # оркестратор (MainWindow) после сбора со всех источников.
+                    self.log.emit(f"\n✅ Собрано моментов: {len(render_jobs)}")
+                    self.progress.emit(100)
+                    EmotionDetector.cleanup()
+                    self.jobs_ready.emit({
+                        'video_path': video_path,
+                        'video_title': self.video_title or '',
+                        'render_jobs': render_jobs,
+                        'work_dir': self.work_dir,
+                    })
+                    return
+
                 # Режим «Компиляция»: одно длинное 16:9 видео вместо вертикальных
                 # клипов. Дальнейший Shorts-рендер полностью пропускается.
                 from .compilation import build_compilation
@@ -453,7 +481,7 @@ class ProcessingThread(QThread):
                 EmotionDetector.cleanup()
                 try:
                     gc.collect(); time.sleep(1)
-                    shutil.rmtree(WORK_DIR, ignore_errors=True)
+                    shutil.rmtree(self.work_dir, ignore_errors=True)
                 except Exception:
                     pass
                 self.finished.emit(output_clips)
@@ -511,7 +539,7 @@ class ProcessingThread(QThread):
             EmotionDetector.cleanup()
             try:
                 gc.collect(); time.sleep(1)
-                shutil.rmtree(WORK_DIR, ignore_errors=True)
+                shutil.rmtree(self.work_dir, ignore_errors=True)
             except Exception:
                 pass
             self.finished.emit(output_clips)
@@ -519,8 +547,11 @@ class ProcessingThread(QThread):
         except Exception as e:
             self.log.emit(f"❌ {e}")
             import traceback; self.log.emit(traceback.format_exc())
-            shutil.rmtree(WORK_DIR, ignore_errors=True)
-            self.finished.emit([])
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+            if self.emit_jobs_only:
+                self.jobs_ready.emit({})
+            else:
+                self.finished.emit([])
 
     # ── Download / transcribe ─────────────────────────────────
 
