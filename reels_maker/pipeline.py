@@ -1011,6 +1011,18 @@ class ProcessingThread(QThread):
         overlap = sum(max(0, min(end, e) - max(start, s)) for s, e in self.sponsor_segments)
         return overlap > (end - start) * 0.25
 
+    # LLM изредка срывается в другой алфавит посреди генерации (в основном
+    # китайские иероглифы — сказывается обучающие данные Qwen) — такой текст
+    # попал бы прямо на экран как оверлей поверх видео. \w в Unicode-регексе
+    # считает иероглифы "словом", так что вместо чёрного списка — явный
+    # белый список разрешённых символов (латиница, кириллица, цифры, базовая
+    # пунктуация).
+    _ALLOWED_TEXT_CHARS = re.compile(r'[^a-zA-Zа-яА-ЯёЁ0-9\s.,!?:;\-—«»\'"()%№&+/]')
+
+    @classmethod
+    def _strip_foreign_script(cls, text: str) -> str:
+        return cls._ALLOWED_TEXT_CHARS.sub('', text)
+
     def generate_clip_title(self, full_text, highlight, words):
         mw = [w['word'] for w in words
               if highlight['start_time'] <= w['start'] <= highlight['end_time']]
@@ -1043,6 +1055,7 @@ class ProcessingThread(QThread):
         title = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', title, flags=re.IGNORECASE)
         title = re.sub(r'^\d+[\.\)]\s*', '', title).split('\n')[0].strip().strip('"\'«»:.-')
         title = re.sub(r'[<>:"/\\|?*]', '', title)[:70]
+        title = self._strip_foreign_script(title).strip()
         if not title or len(title) < 5:
             title = f"Момент в {int(highlight['start_time'])}с"
         self._generated_titles.append(title)
@@ -1061,6 +1074,7 @@ class ProcessingThread(QThread):
             stop=self.CHAT_STOP + ["\n"], echo=False
         )
         hook = out['choices'][0]['text'].strip().strip('"\'«»').split('\n')[0].strip()[:80]
+        hook = self._strip_foreign_script(hook).strip()
         if not hook or len(hook) < 5:
             hook = "Ты не поверишь что произошло..."
         self.log.emit(f"🪝 {hook}")
