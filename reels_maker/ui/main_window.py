@@ -506,8 +506,21 @@ class MainWindow(QMainWindow):
             compilation_enabled=self.output_compilation_radio.isChecked(),
         )
 
+    @staticmethod
+    def _normalize_source(src: str) -> str:
+        """Вставленная из адресной строки ссылка часто приходит без 'https://'
+        (браузер её не показывает) — вместо того чтобы ошибочно объявлять её
+        "файлом не найден", молча дописываем протокол, если это явно домен,
+        а не путь к файлу."""
+        src = src.strip()
+        if not src or os.path.isfile(src) or src.startswith(('http://', 'https://')):
+            return src
+        if re.match(r'^(www\.)?[\w-]+\.[a-zA-Z]{2,}([/?#]|$)', src):
+            return 'https://' + src
+        return src
+
     def start_processing(self):
-        url = self.url_input.text().strip()
+        url = self._normalize_source(self.url_input.text().strip())
         if not url:
             self._log("❌ Вставьте URL или выберите файл"); return
         if not url.startswith('http') and not os.path.isfile(url):
@@ -598,7 +611,7 @@ class MainWindow(QMainWindow):
         if self._multi_comp_index >= self._multi_comp_total:
             self._finish_multi_comp_collection()
             return
-        src = self._multi_comp_queue[self._multi_comp_index]
+        src = self._normalize_source(self._multi_comp_queue[self._multi_comp_index])
         self._multi_comp_index += 1
         label = os.path.basename(src) if os.path.isfile(src) else src
         self._log(
