@@ -452,6 +452,20 @@ class ProcessingThread(QThread):
                     f"⏱️ Подровнял длину {duration_fixed} клипа(ов) под запрошенные "
                     f"{self.clip_duration}±{duration_tolerance:.0f}с"
                 )
+                # Подгонка длины пересчитывает start/end вокруг центра момента и
+                # обрезает по границам видео — у моментов, изначально близких друг
+                # к другу (особенно у самого начала/конца видео, где обрезка "стягивает"
+                # разные центры в одно и то же окно), итоговые диапазоны могут
+                # схлопнуться в одинаковые или почти одинаковые. Ранний дедуп в
+                # find_highlights() этого не видит, т.к. работает ДО подгонки —
+                # прогоняем его ещё раз по уже финальным границам.
+                before_redup = len(highlights)
+                highlights = self._dedupe_highlights(highlights)
+                if before_redup - len(highlights):
+                    self.log.emit(
+                        f"🧬 Убрано ещё {before_redup - len(highlights)} дублирующихся "
+                        f"момент(ов) — совпали после подгонки длины"
+                    )
 
             self.log.emit(f"\n=== ГЕНЕРАЦИЯ ЗАГОЛОВКОВ/ХУКОВ ({len(highlights)}) ===")
             render_jobs = []
