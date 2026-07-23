@@ -1055,35 +1055,47 @@ class ProcessingThread(QThread):
               if highlight['start_time'] <= w['start'] <= highlight['end_time']]
         mt = " ".join(mw)[:600] or full_text[:600]
 
-        avoid = ""
-        recent = self._generated_titles[-6:]
-        if recent:
-            avoid = (
-                "\nУже придуманные названия для других клипов этого видео — "
-                "не повторяй их структуру, первое слово или приём:\n"
-                + "\n".join(f"- {t}" for t in recent)
+        def _ask(extra_instruction=""):
+            avoid = ""
+            recent = self._generated_titles[-6:]
+            if recent:
+                avoid = (
+                    "\nУже придуманные названия для других клипов этого видео — "
+                    "не повторяй их структуру, первые 2-3 слова или приём, даже "
+                    "если меняешь последнее слово:\n"
+                    + "\n".join(f"- {t}" for t in recent)
+                )
+            out = self._llm(
+                self._chat_prompt(
+                    "Придумай короткое (4-8 слов) цепляющее название на русском для "
+                    "этого фрагмента видео. Каждый раз используй РАЗНЫЙ приём: то живая "
+                    "цитата/реплика персонажа, то конкретная деталь из фрагмента, то "
+                    "реакция, то интрига-вопрос. НЕ начинай с шаблонных клише вроде "
+                    "«Как...», «Секрет...», «Вы не поверите...», «Один трюк...» — "
+                    "заголовок должен быть конкретным, про ЭТОТ фрагмент, а не общим. "
+                    "Ответь только названием, без кавычек и пояснений."
+                    f'{avoid}{extra_instruction}\nФрагмент: "{mt}"'
+                ),
+                max_tokens=25, temperature=0.95, top_p=0.92,
+                stop=self.CHAT_STOP + ["\n"], echo=False
             )
+            t = out['choices'][0]['text'].strip()
+            t = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', t, flags=re.IGNORECASE)
+            t = re.sub(r'^\d+[\.\)]\s*', '', t).split('\n')[0].strip().strip('"\'«»:.-')
+            t = re.sub(r'[<>:"/\\|?*]', '', t)[:70]
+            return self._strip_foreign_script(t).strip()
 
-        out = self._llm(
-            self._chat_prompt(
-                "Придумай короткое (4-8 слов) цепляющее название на русском для "
-                "этого фрагмента видео. Каждый раз используй РАЗНЫЙ приём: то живая "
-                "цитата/реплика персонажа, то конкретная деталь из фрагмента, то "
-                "реакция, то интрига-вопрос. НЕ начинай с шаблонных клише вроде "
-                "«Как...», «Секрет...», «Вы не поверите...», «Один трюк...» — "
-                "заголовок должен быть конкретным, про ЭТОТ фрагмент, а не общим. "
-                "Ответь только названием, без кавычек и пояснений."
-                f'{avoid}\nФрагмент: "{mt}"'
-            ),
-            max_tokens=25, temperature=0.95, top_p=0.92,
-            stop=self.CHAT_STOP + ["\n"], echo=False
-        )
-        title = out['choices'][0]['text'].strip()
-        title = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', title, flags=re.IGNORECASE)
-        title = re.sub(r'^\d+[\.\)]\s*', '', title).split('\n')[0].strip().strip('"\'«»:.-')
-        title = re.sub(r'[<>:"/\\|?*]', '', title)[:70]
-        title = self._strip_foreign_script(title).strip()
-        if not title or len(title) < 5:
+        used = {t.lower() for t in self._generated_titles}
+        title = _ask()
+        if title.lower() in used:
+            # Модель иногда буквально повторяет уже придуманное название слово в
+            # слово, несмотря на прямой запрет в промпте (например, "Тонкий руль
+            # мудрости" дважды подряд для двух разных клипов одного видео) — даём
+            # ей ещё одну попытку с явным указанием, какое название под запретом,
+            # прежде чем сдаться на общий фолбэк по времени.
+            title = _ask(f'\nНазвание "{title}" уже использовано для другого клипа — '
+                         f'придумай ДРУГОЕ, не похожее.')
+        if not title or len(title) < 5 or title.lower() in used:
             title = f"Момент в {int(highlight['start_time'])}с"
         self._generated_titles.append(title)
         return title
