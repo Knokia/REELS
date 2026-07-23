@@ -168,6 +168,32 @@ class ProcessingThread(QThread):
         return os.path.join(MODELS_DIR, chosen)
 
     def load_llm(self):
+        # Заготовка под Claude API: если в ai_credentials.json включён бэкенд
+        # "claude" и вписан ключ — используем его вместо локальной модели,
+        # полностью прозрачно для остального кода (find_highlights/generate_
+        # clip_title/generate_hook зовут self._llm(...) одинаково для обоих
+        # бэкендов — см. claude_backend.ClaudeBackend). По умолчанию бэкенд
+        # всегда "local", ничего не меняется, пока пользователь сам не
+        # переключит тумблер в UI. С Claude контекст на порядок больше
+        # локальной модели — нарезка транскрипта на части почти не нужна,
+        # поэтому бюджет чанка тоже поднимаем.
+        from .ai_config import load_ai_settings
+        ai_settings = load_ai_settings()
+        if ai_settings.get("backend") == "claude" and ai_settings.get("claude_api_key"):
+            from .claude_backend import ClaudeBackend
+            model = ai_settings.get("claude_model") or "claude-haiku-4-5-20251001"
+            try:
+                llm = ClaudeBackend(ai_settings["claude_api_key"], model, log_cb=self.log.emit)
+                self.log.emit(f"☁️ LLM: Claude API ({model})")
+                self._max_prompt_tokens = 150_000
+                self._max_chunk_duration = 24 * 3600  # практически не режем по длительности
+                return llm
+            except Exception as e:
+                self.log.emit(f"⚠️ Claude API недоступен ({e}) — откатываюсь на локальную модель")
+
+        self._max_prompt_tokens = self.MAX_PROMPT_TOKENS
+        self._max_chunk_duration = self.MAX_CHUNK_DURATION
+
         mp2   = self.find_model()
         pat   = re.compile(r'-(\d+)-of-(\d+)\.gguf$', re.IGNORECASE)
         match = pat.search(os.path.basename(mp2))
@@ -482,7 +508,13 @@ class ProcessingThread(QThread):
                 render_jobs.append({'highlight': h, 'title': clip_title,
                                      'hook_text': hook_text, 'zoom_plan': zoom_plan})
 
-            # LLM больше не нужен — освобождаем память перед параллельным рендером
+            # LLM больше не нужен — освобождаем память перед параллельным рендером.
+            # Для Claude API логируем реальную потраченную сумму (посчитана из
+            # usage каждого ответа — см. ClaudeBackend) ДО того, как объект
+            # освобождён, иначе total_cost_usd будет не у кого спросить.
+            cost = getattr(self._llm, 'total_cost_usd', None)
+            if cost is not None:
+                self.log.emit(f"💰 Потрачено на Claude API за этот прогон: ${cost:.4f}")
             del self._llm; self._llm = None; gc.collect()
 
             if self.compilation_enabled:
@@ -772,12 +804,14 @@ class ProcessingThread(QThread):
 
     def _fit_text_to_context(self, text: str, prompt_template: str, max_tokens: int, safety: int = 500) -> str:
         """Обрезает text по фактическому числу токенов модели (а не наугад по
-        символам), но не приближается к границе n_ctx — см. MAX_PROMPT_TOKENS.
-        prompt_template — тот же промпт с text="" внутри, чтобы посчитать
-        накладные расходы (инструкции, список сцен и т.п.)."""
+        символам), но не приближается к границе n_ctx — см. self._max_prompt_tokens
+        (устанавливается в load_llm(): MAX_PROMPT_TOKENS для локальной модели,
+        больше для Claude — см. заготовку под Claude API). prompt_template —
+        тот же промпт с text="" внутри, чтобы посчитать накладные расходы
+        (инструкции, список сцен и т.п.)."""
         n_ctx = self._llm.n_ctx()
         other_tokens = len(self._llm.tokenize(prompt_template.encode("utf-8"), add_bos=True))
-        budget = min(n_ctx - other_tokens - max_tokens - safety, self.MAX_PROMPT_TOKENS)
+        budget = min(n_ctx - other_tokens - max_tokens - safety, self._max_prompt_tokens)
         if budget <= 0:
             return ""
         tokens = self._llm.tokenize(text.encode("utf-8"), add_bos=False)
@@ -814,7 +848,7 @@ class ProcessingThread(QThread):
             return [None]
         full_text = self._words_to_timestamped_text(words)
         total_tokens = len(self._llm.tokenize(full_text.encode("utf-8"), add_bos=False))
-        token_budget = self.MAX_PROMPT_TOKENS - 1500  # запас под сам промпт/инструкции/ответ
+        token_budget = self._max_prompt_tokens - 1500  # запас под сам промпт/инструкции/ответ
         total_span = words[-1]['end'] - words[0]['start']
 
         # Раньше резали только по бюджету токенов — для очень длинных видео это
@@ -825,11 +859,14 @@ class ProcessingThread(QThread):
         # токенов, теряя большую часть видео разом. Дополнительно ограничиваем
         # чанк по РЕАЛЬНОЙ длительности — так каждый вызов остаётся быстрым, а
         # обрыв (если случится) теряет лишь небольшой кусок, а не половину ролика.
-        if total_tokens <= token_budget and total_span <= self.MAX_CHUNK_DURATION:
+        # (self._max_chunk_duration — для Claude практически без верхней границы,
+        # см. load_llm(); ограничение по квадратичному attention актуально
+        # только для локальной модели.)
+        if total_tokens <= token_budget and total_span <= self._max_chunk_duration:
             return [words]
 
         n_by_tokens   = -(-total_tokens // token_budget)          # ceil
-        n_by_duration = -(-int(total_span) // self.MAX_CHUNK_DURATION)  # ceil
+        n_by_duration = -(-int(total_span) // self._max_chunk_duration)  # ceil
         n_chunks = max(n_by_tokens, n_by_duration, 1)
         chunk_size = -(-len(words) // n_chunks)  # ceil
         return [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]

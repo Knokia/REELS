@@ -17,6 +17,11 @@ llama_cpp_python @ https://github.com/abetlen/llama-cpp-python/releases/download
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 
+# Claude API — заготовка под опциональный облачный LLM-бэкенд (см.
+# reels_maker/claude_backend.py). Нужен, только если в UI включён бэкенд
+# "Claude API"; локальный режим работает и без него.
+anthropic
+
 # YouTube Data API v3
 google-api-python-client==2.196.0
 google-auth==2.52.0

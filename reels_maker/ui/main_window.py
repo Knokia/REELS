@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self.session_log = SessionLog()
         self.setup_ui()
         self._load_settings()
+        self._load_ai_settings()
 
     def _log(self, text: str):
         """Единая точка логирования: в окно и в файл logs/run_*.txt."""
@@ -348,8 +349,91 @@ class MainWindow(QMainWindow):
         al2.addWidget(self.virality_cb); al2.addWidget(self.multi_speaker_cb)
         al2.addWidget(emo_info); al2.addWidget(info2)
         ag2.setLayout(al2); layout.addWidget(ag2)
+
+        layout.addWidget(self._build_ai_provider_box())
         layout.addStretch()
         return tab
+
+    def _build_ai_provider_box(self):
+        """Заготовка под Claude API: переключатель локальная модель / Claude —
+        по умолчанию всегда локальная, поведение приложения не меняется, пока
+        пользователь сам не включит Claude и не впишет свой ключ. Настройки
+        хранятся отдельно от settings.ini — в ai_credentials.json (как
+        yt_accounts.json для YouTube), см. reels_maker/ai_config.py."""
+        box = QGroupBox("☁️ AI-провайдер (поиск моментов, заголовки, хуки)")
+        bl = QVBoxLayout()
+
+        self.ai_local_radio = QRadioButton("💻 Локальная модель (бесплатно, GPU)")
+        self.ai_local_radio.setChecked(True)
+        self.ai_claude_radio = QRadioButton("☁️ Claude API (платно, оплата отдельно от подписки claude.ai)")
+        for rb in (self.ai_local_radio, self.ai_claude_radio):
+            rb.setStyleSheet("font-weight:bold;padding:3px;")
+            bl.addWidget(rb)
+        self.ai_provider_group = QButtonGroup(self)
+        self.ai_provider_group.addButton(self.ai_local_radio)
+        self.ai_provider_group.addButton(self.ai_claude_radio)
+
+        claude_row = QHBoxLayout()
+        claude_row.addWidget(QLabel("Модель:"))
+        self.claude_model_combo = QComboBox()
+        self.claude_model_combo.addItems([
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-5",
+        ])
+        claude_row.addWidget(self.claude_model_combo)
+        bl.addLayout(claude_row)
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("API-ключ:"))
+        self.claude_key_input = QLineEdit()
+        self.claude_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.claude_key_input.setPlaceholderText("sk-ant-...")
+        key_row.addWidget(self.claude_key_input)
+        bl.addLayout(key_row)
+
+        note = QLabel(
+            "ℹ️ Токены оплачиваются через отдельный API-биллинг на console.anthropic.com — "
+            "подписка Pro/Max на claude.ai их НЕ покрывает. Ключ хранится только локально "
+            "в ai_credentials.json (не в git)."
+        )
+        note.setStyleSheet("color:#888;font-size:10px;padding:2px;")
+        note.setWordWrap(True)
+        bl.addWidget(note)
+
+        box.setLayout(bl)
+        self.ai_local_radio.toggled.connect(self._on_ai_provider_changed)
+        self.claude_model_combo.currentTextChanged.connect(self._save_ai_settings)
+        self.claude_key_input.editingFinished.connect(self._save_ai_settings)
+        return box
+
+    def _on_ai_provider_changed(self):
+        is_claude = self.ai_claude_radio.isChecked()
+        self.claude_model_combo.setEnabled(is_claude)
+        self.claude_key_input.setEnabled(is_claude)
+        self._save_ai_settings()
+
+    def _save_ai_settings(self):
+        from ..ai_config import save_ai_settings
+        save_ai_settings({
+            "backend": "claude" if self.ai_claude_radio.isChecked() else "local",
+            "claude_model": self.claude_model_combo.currentText(),
+            "claude_api_key": self.claude_key_input.text().strip(),
+        })
+
+    def _load_ai_settings(self):
+        from ..ai_config import load_ai_settings
+        s = load_ai_settings()
+        if s.get("backend") == "claude":
+            self.ai_claude_radio.setChecked(True)
+        else:
+            self.ai_local_radio.setChecked(True)
+        model = s.get("claude_model", "")
+        if model:
+            idx = self.claude_model_combo.findText(model)
+            if idx >= 0:
+                self.claude_model_combo.setCurrentIndex(idx)
+        self.claude_key_input.setText(s.get("claude_api_key", ""))
+        self._on_ai_provider_changed()
 
     def _build_subtitles_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)

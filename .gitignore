@@ -4,6 +4,7 @@ client_secret_*.json
 yt_oauth_creds.json
 yt_accounts.json
 yt_quota.json
+ai_credentials.json
 
 # Python
 __pycache__/
