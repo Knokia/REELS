@@ -1087,6 +1087,22 @@ class ProcessingThread(QThread):
     def _strip_foreign_script(cls, text: str) -> str:
         return cls._ALLOWED_TEXT_CHARS.sub('', text)
 
+    @staticmethod
+    def _truncate_at_word(text: str, limit: int) -> str:
+        """Обрезает до limit символов, но не разрывая слово. Жёсткий срез [:limit]
+        выводил на экран куски вроде "...беременность в 52 г" (обрублено ровно на
+        70-м символе от "52 года") — в формате «по центру» заголовок висит поверх
+        всего ролика, так что такой обрубок видит каждый зритель."""
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        # Если срез пришёлся ровно на пробел, слово не разорвано — резать нечего.
+        if not text[limit].isspace():
+            space = cut.rfind(' ')
+            if space > 0:
+                cut = cut[:space]
+        return cut.rstrip(' ,.;:-—')
+
     def generate_clip_title(self, full_text, highlight, words):
         mw = [w['word'] for w in words
               if highlight['start_time'] <= w['start'] <= highlight['end_time']]
@@ -1119,7 +1135,7 @@ class ProcessingThread(QThread):
             t = out['choices'][0]['text'].strip()
             t = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', t, flags=re.IGNORECASE)
             t = re.sub(r'^\d+[\.\)]\s*', '', t).split('\n')[0].strip().strip('"\'«»:.-')
-            t = re.sub(r'[<>:"/\\|?*]', '', t)[:70]
+            t = self._truncate_at_word(re.sub(r'[<>:"/\\|?*]', '', t), 70)
             return self._strip_foreign_script(t).strip()
 
         used = {t.lower() for t in self._generated_titles}
@@ -1467,10 +1483,13 @@ class ProcessingThread(QThread):
 
             # ── Subtitles ─────────────────────────────────────
             self.log.emit("💬 Субтитры...")
+            # .strip() обязателен: faster-whisper отдаёт слова С ведущим пробелом
+            # (' Это', ' Первый'), а рендер субтитров склеивает их через ' ' —
+            # без strip на экране получались двойные пробелы ("Коварные  сексологи,").
             subtitle_words = [
                 (ws - start, we - start, wt)
-                for ws, we, wt in [(w2['start'], w2['end'], w2['word']) for w2 in words]
-                if start <= ws <= end
+                for ws, we, wt in [(w2['start'], w2['end'], w2['word'].strip()) for w2 in words]
+                if start <= ws <= end and wt
             ]
             if subtitle_words:
                 fs2 = FONT_SETTINGS; wpf = fs2.words_per_phrase
