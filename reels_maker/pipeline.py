@@ -1143,44 +1143,62 @@ class ProcessingThread(QThread):
     # берём за потолок (промпт при этом просит 3-5 слов).
     MAX_TITLE_CHARS = 46
 
+    # Доля засечек лиц, которая обязана попасть внутрь окна кропа. Требовать
+    # 100% оказалось нежизнеспособно: на реальном материале детектор регулярно
+    # даёт одиночные ложные срабатывания у самых краёв кадра (замер на реальном
+    # ролике: разброс 65.7% ширины против окна в 64.7% — кроп отменялся из-за
+    # пары засечек, хотя основная масса лиц укладывалась в 48%). Порог ниже
+    # терпит редкие выбросы, но всё ещё отменяет кроп, если за границей окна
+    # остаётся устойчивая группа лиц — то есть реальный второй человек.
+    CENTERED_CROP_MIN_COVERAGE = 0.85
+
     @classmethod
     def _action_crop_window(cls, face_boxes: dict, start: float, end: float,
                             src_w: int, src_h: int):
         """Окно кропа (x, y, w, h) в пикселях вокруг людей в кадре, либо None,
-        если кропить нечего или небезопасно (лица занимают всю ширину — значит,
-        подрезав, мы кого-нибудь отрежем)."""
+        если кропить нечего или небезопасно (в кадре есть люди, которых окно
+        не вмещает — подрезав, мы бы их срезали)."""
         if not face_boxes or src_w <= 0 or src_h <= 0:
             return None
         win_w = int(min(src_w, src_h * cls.CENTERED_CROP_ASPECT))
         if win_w >= src_w:
             return None  # исходник и так не шире целевого окна — резать нечего
 
-        centers, lefts, rights = [], [], []
+        faces = []  # (левый край, правый край, центр) в пикселях
         for t, boxes in face_boxes.items():
             if not (start <= t <= end):
                 continue
             for (bx, by, bw, bh) in boxes:
-                lefts.append(bx)
-                rights.append(bx + bw)
-                centers.append(bx + bw / 2)
-        if len(centers) < 3:
+                faces.append((bx * src_w, (bx + bw) * src_w, (bx + bw / 2) * src_w))
+        if len(faces) < 3:
             return None  # людей почти не видно — оставляем кадр как есть
 
-        span_l, span_r = min(lefts) * src_w, max(rights) * src_w
-        # Оставляем немного воздуха по краям, чтобы лица не упирались в границу.
-        margin = 0.06 * src_w
-        needed = (span_r + margin) - (span_l - margin)
-        if needed > win_w:
-            return None  # люди разнесены шире окна — любой кроп кого-то срежет
+        margin = 0.02 * src_w  # немного воздуха, чтобы лицо не упиралось в срез
 
-        centers.sort()
-        focus = centers[len(centers) // 2] * src_w  # медиана устойчивее среднего
-        x1 = int(round(focus - win_w / 2))
-        # Гарантируем, что все лица остались внутри окна, и не вылезаем за кадр.
-        x1 = min(x1, int(span_l - margin))
-        x1 = max(x1, int(span_r + margin) - win_w)
-        x1 = max(0, min(x1, src_w - win_w))
-        return x1, 0, win_w, src_h
+        def coverage(x1):
+            inside = sum(1 for l, r, _ in faces
+                         if l >= x1 - margin and r <= x1 + win_w + margin)
+            return inside / len(faces)
+
+        centers = sorted(c for _, _, c in faces)
+        median_c = centers[len(centers) // 2]
+        # Кандидаты: окно по медиане (самый естественный кадр) и окна, выровненные
+        # по каждому лицу — среди них ищем то, что вмещает больше всего засечек,
+        # при равенстве предпочитая ближайшее к медиане.
+        cands = {median_c - win_w / 2}
+        for l, r, c in faces:
+            cands.add(c - win_w / 2)
+            cands.add(l - margin)
+            cands.add(r + margin - win_w)
+        options = []
+        for x1 in cands:
+            x1 = int(max(0, min(round(x1), src_w - win_w)))
+            options.append((coverage(x1), -abs((x1 + win_w / 2) - median_c), x1))
+        best_cov, _, best_x1 = max(options)
+
+        if best_cov < cls.CENTERED_CROP_MIN_COVERAGE:
+            return None  # за окном осталась заметная группа лиц — не режем
+        return best_x1, 0, win_w, src_h
 
     @staticmethod
     def _truncate_at_word(text: str, limit: int) -> str:
