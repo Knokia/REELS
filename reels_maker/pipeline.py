@@ -160,6 +160,11 @@ class ProcessingThread(QThread):
         # Заголовки, уже сгенерированные в этом прогоне — подсказываем модели
         # их не повторять, иначе все клипы одного видео скатываются в один шаблон.
         self._generated_titles  = []
+        # Значения под локальную модель; load_llm() поднимет их, если выбран
+        # Claude API. Заданы уже здесь, чтобы нарезка транскрипта не падала с
+        # AttributeError, если load_llm() не вызывался или упал на полпути.
+        self._max_prompt_tokens  = self.MAX_PROMPT_TOKENS
+        self._max_chunk_duration = self.MAX_CHUNK_DURATION
 
     # ── Model loading ─────────────────────────────────────────
 
@@ -521,14 +526,15 @@ class ProcessingThread(QThread):
 
             # Финальный отбор. Все чистки (порог виральности, привязка границ,
             # подгонка длины, оба дедупа) уже позади, поэтому здесь мы берём
-            # ровно столько лучших моментов, сколько просил пользователь, и
-            # больше их ничто не «съедает». Отбираем по виральности, а порядок
-            # в ролике оставляем хронологический.
+            # ровно столько моментов, сколько просил пользователь, и больше их
+            # ничто не «съедает». Отбираем не просто топ по виральности, а лучший
+            # момент из каждого участка видео: иначе клипы легко сбиваются в одну
+            # удачную часть ролика, и остальное видео остаётся неиспользованным.
             if len(highlights) > self.clip_count:
-                highlights = sorted(
-                    highlights, key=lambda x: x.get('virality_score', 0.0), reverse=True
-                )[:self.clip_count]
-                highlights.sort(key=lambda x: x['start_time'])
+                highlights = self._select_spread(
+                    highlights, self.clip_count, duration,
+                    score_key=lambda x: x.get('virality_score', 0.0),
+                )
             if len(highlights) < self.clip_count:
                 self.log.emit(
                     f"ℹ️ Итоговых моментов {len(highlights)} из запрошенных "
@@ -1057,7 +1063,53 @@ class ProcessingThread(QThread):
                 f"⏱️ Расширил {too_short} момент(ов) короче {self.MIN_CLIP_DURATION}с "
                 f"(попали в короткую сцену/склейку)"
             )
-        return sorted(valid[:count], key=lambda x: x['start_time'])
+        # НЕ `valid[:count]`: список отсортирован по времени, и срез оставлял бы
+        # count самых ранних моментов — из-за этого все клипы выходили из первых
+        # минут видео. Берём кандидатов равномерно по всей длине.
+        return self._select_spread(valid, count, duration)
+
+    @staticmethod
+    def _select_spread(items: list, count: int, duration: float, score_key=None) -> list:
+        """Отбирает count моментов, РАВНОМЕРНО разнесённых по всей длине видео.
+
+        Заменяет прежний срез `valid[:count]`, который был источником главного
+        перекоса: к моменту среза список уже отсортирован по времени (так его
+        отдаёт _dedupe_highlights), поэтому срез оставлял просто N САМЫХ РАННИХ
+        моментов. На часовом ролике LLM возвращала до 268 кандидатов по всей
+        длине, из них выживали 18 первых — и все клипы получались из первых
+        минут видео.
+
+        Делим длину на count равных корзин и берём по одному моменту из каждой
+        (лучший по score_key, если он задан). Если какие-то корзины пустые —
+        добираем остаток из самых сильных оставшихся."""
+        if count <= 0:
+            return []
+        if len(items) <= count:
+            return sorted(items, key=lambda x: x['start_time'])
+
+        span = max(duration, 1e-6)
+        bins = [[] for _ in range(count)]
+        for h in items:
+            mid = (h['start_time'] + h['end_time']) / 2
+            idx = int(mid / span * count)
+            bins[min(max(idx, 0), count - 1)].append(h)
+
+        def rank(bucket):
+            if score_key is None:
+                return bucket
+            return sorted(bucket, key=score_key, reverse=True)
+
+        chosen, leftovers = [], []
+        for bucket in bins:
+            if not bucket:
+                continue
+            ordered = rank(bucket)
+            chosen.append(ordered[0])
+            leftovers.extend(ordered[1:])
+
+        if len(chosen) < count and leftovers:
+            chosen.extend(rank(leftovers)[:count - len(chosen)])
+        return sorted(chosen, key=lambda x: x['start_time'])
 
     def _expand_to_min_duration(self, h: dict, duration: float) -> dict:
         """Симметрично расширяет момент короче MIN_CLIP_DURATION вокруг его центра,
