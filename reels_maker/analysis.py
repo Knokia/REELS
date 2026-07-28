@@ -110,9 +110,25 @@ class MultimodalAnalyzer:
 
     @staticmethod
     def detect_faces_timeline(video_path: str, sample_fps: float = 1.0) -> dict:
+        counts, _, _ = MultimodalAnalyzer.detect_visual_timeline(video_path, sample_fps)
+        return counts
+
+    @staticmethod
+    def detect_visual_timeline(video_path: str, sample_fps: float = 1.0):
+        """Один проход по видео -> три таймлайна:
+          counts[t] — сколько лиц найдено в кадре;
+          motion[t] — насколько кадр отличается от предыдущего (0..1), нужно, чтобы
+                      отличать живое действие от статичной заставки/фотографии,
+                      которую иначе скоринг спокойно берёт в топ на все 25 секунд;
+          boxes[t]  — рамки лиц в НОРМАЛИЗОВАННЫХ координатах (x, y, w, h в долях
+                      кадра), по ним режим «по центру» подрезает исходник к зоне
+                      действия, чтобы люди не были крошечными в общем плане.
+        Всё считается за один проход намеренно: декодирование часового видео стоит
+        минуты, а раньше здесь уже был ровно такой же цикл ради одних лишь счётчиков."""
         try:
             import cv2
-            result = {}
+            import numpy as np
+            counts, motion, boxes = {}, {}, {}
             cap    = cv2.VideoCapture(video_path)
             fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
             step   = max(1, int(fps / sample_fps))
@@ -129,28 +145,48 @@ class MultimodalAnalyzer:
                     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
                 )
             frame_idx = 0
+            prev_small = None
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 if frame_idx % step == 0:
                     t = round(frame_idx / fps, 2)
+                    fh, fw = frame.shape[:2]
                     if use_mp:
                         rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         res   = mp_det.process(rgb)
-                        count = len(res.detections) if res.detections else 0
+                        dets  = res.detections or []
+                        count = len(dets)
+                        bb = []
+                        for d in dets:
+                            r = d.location_data.relative_bounding_box
+                            bb.append((r.xmin, r.ymin, r.width, r.height))
                     else:
                         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         faces = face_cascade.detectMultiScale(gray, 1.1, 4)
                         count = len(faces)
-                    result[t] = count
+                        bb = [(x / fw, y / fh, w / fw, h / fh) for x, y, w, h in faces]
+                    counts[t] = count
+                    boxes[t]  = bb
+
+                    # Дешёвая метрика движения: средняя разница яркости с предыдущим
+                    # сэмплом на сильно уменьшенной копии кадра. Статичная картинка
+                    # даёт ~0, живое действие/смена плана — заметно больше.
+                    small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 36))
+                    if prev_small is not None:
+                        diff = np.abs(small.astype(np.int16) - prev_small.astype(np.int16))
+                        motion[t] = float(diff.mean()) / 255.0
+                    else:
+                        motion[t] = 0.0
+                    prev_small = small
                 frame_idx += 1
             cap.release()
             if mp_det:
                 mp_det.close()
-            return result
+            return counts, motion, boxes
         except Exception:
-            return {}
+            return {}, {}, {}
 
     @staticmethod
     def sentiment_score(text: str) -> float:

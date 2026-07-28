@@ -92,14 +92,23 @@ class ProcessingThread(QThread):
 
     # Кандидатов для анализа всегда берём больше, чем нужно финальных клипов —
     # иначе скорингу виральности физически не из чего отсеивать слабые.
-    CANDIDATE_OVERHEAD = 8
-    MAX_CANDIDATES = 25
+    # Запас кандидатов должен переживать обе чистки (порог виральности + два
+    # дедупа), иначе на 10 запрошенных клипов остаётся 7-8. Кандидаты почти
+    # бесплатны: LLM всё равно возвращает столько, сколько сочтёт нужным, а
+    # скоринг считается по уже готовым таймлайнам.
+    CANDIDATE_OVERHEAD = 12
+    MAX_CANDIDATES = 30
     MIN_VIRALITY_SCORE = 0.25
     # Ничто раньше не проверяло длину момента — LLM иногда предлагает (или
     # scene-snap схлопывает до) момент в несколько секунд, особенно в быстро
     # смонтированных заставках/тизерах в начале выпуска. Такой огрызок проходит
     # дальше как валидный клип. Расширяем всё, что короче этого порога.
     MIN_CLIP_DURATION = 15
+    # Ниже этого значения средняя разница между соседними сэмплами кадра
+    # считается «картинка стоит»: в ток-шоу это фотография/титр во весь экран,
+    # из которого получается 25 секунд неподвижного кадра. Порог подобран по
+    # замеру: абсолютно статичное видео даёт 0.000, движение в сцене — ~0.1.
+    STATIC_MOTION_THRESHOLD = 0.02
 
     def __init__(self, url, quality, language, clip_duration,
                  zoom_enabled, zoom_intensity,
@@ -371,8 +380,17 @@ class ProcessingThread(QThread):
                 del audio_y
             except Exception as e:
                 self.log.emit(f"⚠️ Аудио-анализ недоступен ({e}) — зум/скоринг будут работать без него")
-            face_timeline  = MultimodalAnalyzer.detect_faces_timeline(video_path, 0.5)
+            # Один проход даёт сразу счётчики лиц, метрику движения и рамки лиц —
+            # движение отсеивает статичные заставки в скоринге, рамки нужны режиму
+            # «по центру», чтобы подрезать общий план к людям.
+            face_timeline, motion_timeline, face_boxes = \
+                MultimodalAnalyzer.detect_visual_timeline(video_path, 0.5)
             self.log.emit(f"👤 Кадров с лицами: {len(face_timeline)}")
+            if motion_timeline:
+                still = sum(1 for v in motion_timeline.values() if v < self.STATIC_MOTION_THRESHOLD)
+                self.log.emit(
+                    f"🎞️ Динамика картинки: {still}/{len(motion_timeline)} кадров почти статичны"
+                )
 
             # Эмоции — только MediaPipe + OpenCV Haar (без сторонних ML)
             self.log.emit("😊 Определяю эмоции (MediaPipe Face Mesh)...")
@@ -408,19 +426,27 @@ class ProcessingThread(QThread):
                 self.log.emit("\n=== СКОРИНГ ВИРАЛЬНОСТИ ==="); self.progress.emit(55)
                 highlights = ViralityScorer.score_highlights(
                     highlights, words, audio_energies,
-                    face_timeline, speech_rates, laugh_events
+                    face_timeline, speech_rates, laugh_events,
+                    motion_timeline
                 )
                 for i, h in enumerate(highlights):
                     vs  = h.get('virality_score', 0.0)
                     bar = '█' * int(vs * 10) + '░' * (10 - int(vs * 10))
-                    self.log.emit(f"   #{i+1} [{bar}] {vs:.3f}")
+                    static_mark = ' 🧊статика' if h.get('_features', {}).get('is_static') else ''
+                    self.log.emit(f"   #{i+1} [{bar}] {vs:.3f}{static_mark}")
+                # ВАЖНО: раньше здесь стояла отсечка [:self.clip_count] — и только
+                # ПОСЛЕ неё шли привязка границ, подгонка длины и дедуп, которые
+                # выбрасывали ещё 2-3 момента. В итоге на 10 запрошенных клипов
+                # стабильно выходило 7-8. Теперь ниже по пайплайну идут ВСЕ моменты
+                # выше порога, а до clip_count список урезается уже после дедупа —
+                # см. «финальный отбор» перед генерацией заголовков.
                 before = len(highlights)
                 highlights = [h for h in highlights
-                             if h.get('virality_score', 0.0) >= self.MIN_VIRALITY_SCORE][:self.clip_count]
+                              if h.get('virality_score', 0.0) >= self.MIN_VIRALITY_SCORE]
                 highlights.sort(key=lambda x: x['start_time'])
                 self.log.emit(
                     f"🧹 Отсеяно {before - len(highlights)} слабых момент(ов) "
-                    f"(порог {self.MIN_VIRALITY_SCORE}) → в работу: {len(highlights)}"
+                    f"(порог {self.MIN_VIRALITY_SCORE}) → дальше в работу: {len(highlights)}"
                 )
             else:
                 highlights = highlights[:self.clip_count]
@@ -492,6 +518,22 @@ class ProcessingThread(QThread):
                         f"🧬 Убрано ещё {before_redup - len(highlights)} дублирующихся "
                         f"момент(ов) — совпали после подгонки длины"
                     )
+
+            # Финальный отбор. Все чистки (порог виральности, привязка границ,
+            # подгонка длины, оба дедупа) уже позади, поэтому здесь мы берём
+            # ровно столько лучших моментов, сколько просил пользователь, и
+            # больше их ничто не «съедает». Отбираем по виральности, а порядок
+            # в ролике оставляем хронологический.
+            if len(highlights) > self.clip_count:
+                highlights = sorted(
+                    highlights, key=lambda x: x.get('virality_score', 0.0), reverse=True
+                )[:self.clip_count]
+                highlights.sort(key=lambda x: x['start_time'])
+            if len(highlights) < self.clip_count:
+                self.log.emit(
+                    f"ℹ️ Итоговых моментов {len(highlights)} из запрошенных "
+                    f"{self.clip_count} — больше подходящих в этом видео не нашлось"
+                )
 
             self.log.emit(f"\n=== ГЕНЕРАЦИЯ ЗАГОЛОВКОВ/ХУКОВ ({len(highlights)}) ===")
             render_jobs = []
@@ -584,6 +626,7 @@ class ProcessingThread(QThread):
                         job['title'], job['zoom_plan'], job['hook_text'],
                         emotion_timeline, ffmpeg_threads=ffmpeg_threads,
                         index=self.index_offset + idx,
+                        face_boxes=face_boxes,
                     )
                     return idx, {
                         'path':           path,
@@ -1087,6 +1130,58 @@ class ProcessingThread(QThread):
     def _strip_foreign_script(cls, text: str) -> str:
         return cls._ALLOWED_TEXT_CHARS.sub('', text)
 
+    # Режим «по центру» вписывает исходник целиком, поэтому 16:9 занимает лишь
+    # ~32% высоты вертикального кадра, а человек в общем плане студии выходит
+    # крошечным. Подрезаем исходник ТОЛЬКО по горизонтали (слева/справа, где в
+    # общем плане обычно пустая декорация) до этого соотношения — по вертикали
+    # не режем никогда, иначе у людей отсекает голову или пояс.
+    CENTERED_CROP_ASPECT = 1.15
+
+    # Заголовок в режиме «по центру» висит поверх всего ролика, и на реальных
+    # прогонах 70-символьные названия разворачивались в 4 строки, занимая ~25%
+    # экрана. Замер по отрендеренным кадрам: ~45 символов = 2 строки, что и
+    # берём за потолок (промпт при этом просит 3-5 слов).
+    MAX_TITLE_CHARS = 46
+
+    @classmethod
+    def _action_crop_window(cls, face_boxes: dict, start: float, end: float,
+                            src_w: int, src_h: int):
+        """Окно кропа (x, y, w, h) в пикселях вокруг людей в кадре, либо None,
+        если кропить нечего или небезопасно (лица занимают всю ширину — значит,
+        подрезав, мы кого-нибудь отрежем)."""
+        if not face_boxes or src_w <= 0 or src_h <= 0:
+            return None
+        win_w = int(min(src_w, src_h * cls.CENTERED_CROP_ASPECT))
+        if win_w >= src_w:
+            return None  # исходник и так не шире целевого окна — резать нечего
+
+        centers, lefts, rights = [], [], []
+        for t, boxes in face_boxes.items():
+            if not (start <= t <= end):
+                continue
+            for (bx, by, bw, bh) in boxes:
+                lefts.append(bx)
+                rights.append(bx + bw)
+                centers.append(bx + bw / 2)
+        if len(centers) < 3:
+            return None  # людей почти не видно — оставляем кадр как есть
+
+        span_l, span_r = min(lefts) * src_w, max(rights) * src_w
+        # Оставляем немного воздуха по краям, чтобы лица не упирались в границу.
+        margin = 0.06 * src_w
+        needed = (span_r + margin) - (span_l - margin)
+        if needed > win_w:
+            return None  # люди разнесены шире окна — любой кроп кого-то срежет
+
+        centers.sort()
+        focus = centers[len(centers) // 2] * src_w  # медиана устойчивее среднего
+        x1 = int(round(focus - win_w / 2))
+        # Гарантируем, что все лица остались внутри окна, и не вылезаем за кадр.
+        x1 = min(x1, int(span_l - margin))
+        x1 = max(x1, int(span_r + margin) - win_w)
+        x1 = max(0, min(x1, src_w - win_w))
+        return x1, 0, win_w, src_h
+
     @staticmethod
     def _truncate_at_word(text: str, limit: int) -> str:
         """Обрезает до limit символов, но не разрывая слово. Жёсткий срез [:limit]
@@ -1120,8 +1215,10 @@ class ProcessingThread(QThread):
                 )
             out = self._llm(
                 self._chat_prompt(
-                    "Придумай короткое (4-8 слов) цепляющее название на русском для "
-                    "этого фрагмента видео. Каждый раз используй РАЗНЫЙ приём: то живая "
+                    "Придумай ОЧЕНЬ короткое (3-5 слов, не длиннее 40 символов) цепляющее "
+                    "название на русском для этого фрагмента видео. Оно накладывается "
+                    "поверх вертикального видео, поэтому длинное название занимает пол-экрана "
+                    "— чем короче, тем лучше. Каждый раз используй РАЗНЫЙ приём: то живая "
                     "цитата/реплика персонажа, то конкретная деталь из фрагмента, то "
                     "реакция, то интрига-вопрос. НЕ начинай с шаблонных клише вроде "
                     "«Как...», «Секрет...», «Вы не поверите...», «Один трюк...» — "
@@ -1135,7 +1232,7 @@ class ProcessingThread(QThread):
             t = out['choices'][0]['text'].strip()
             t = re.sub(r'^(Название:?|Вариант\s*\d*:?)\s*', '', t, flags=re.IGNORECASE)
             t = re.sub(r'^\d+[\.\)]\s*', '', t).split('\n')[0].strip().strip('"\'«»:.-')
-            t = self._truncate_at_word(re.sub(r'[<>:"/\\|?*]', '', t), 70)
+            t = self._truncate_at_word(re.sub(r'[<>:"/\\|?*]', '', t), self.MAX_TITLE_CHARS)
             return self._strip_foreign_script(t).strip()
 
         used = {t.lower() for t in self._generated_titles}
@@ -1387,7 +1484,8 @@ class ProcessingThread(QThread):
 
     def cut_and_caption(self, input_path, start, end, words,
                         title=None, zoom_plan=None, hook_text=None,
-                        emotion_timeline=None, ffmpeg_threads=4, index=None):
+                        emotion_timeline=None, ffmpeg_threads=4, index=None,
+                        face_boxes=None):
         output_dir = os.path.join(CLIPS_DIR, self.clip_subdir) if self.clip_subdir else CLIPS_DIR
         os.makedirs(output_dir, exist_ok=True)
         safe = re.sub(r'[<>:"/\\|?*]', '', title or f"clip_{int(start)}")[:60].strip(' .')
@@ -1401,14 +1499,30 @@ class ProcessingThread(QThread):
             w_out, h_out = 1080, 1920
 
             if self.centered_layout_enabled:
-                # Альтернативный формат: без кропа/зума/фокуса на лицах — исходник
-                # целиком вписывается в кадр (contain-fit) и центрируется; сверху и
+                # Альтернативный формат: без зума и слежения за лицом — исходник
+                # вписывается в кадр целиком (contain-fit) и центрируется; сверху и
                 # снизу — не чёрные полосы, а размытая затемнённая растяжка того же
                 # кадра (cover-fit), похожая на тень/подложку, а не пустое поле.
                 self.log.emit("🖼️ Формат «по центру» (тень по краям)...")
                 from moviepy import CompositeVideoClip
-                scale  = min(w_out / clip.w, h_out / clip.h)
-                fitted = clip.resized(scale)
+
+                # Общий план 16:9 вписывается всего в ~32% высоты вертикального
+                # кадра, и человек в студии выглядит крошечным. Если видно, где
+                # именно люди, подрезаем пустые края по горизонтали — тогда после
+                # вписывания картинка занимает заметно больше экрана.
+                src_for_fit = clip
+                window = self._action_crop_window(face_boxes or {}, start, end,
+                                                  clip.w, clip.h)
+                if window:
+                    x1, y1, cw, ch = window
+                    src_for_fit = clip.cropped(x1=x1, y1=y1, width=cw, height=ch)
+                    self.log.emit(
+                        f"🔍 Подрезал пустые края: {clip.w}→{cw}px по ширине "
+                        f"(люди в кадре крупнее)"
+                    )
+
+                scale  = min(w_out / src_for_fit.w, h_out / src_for_fit.h)
+                fitted = src_for_fit.resized(scale)
 
                 def blur_shadow(get_frame, t):
                     import cv2
@@ -1416,10 +1530,13 @@ class ProcessingThread(QThread):
                     blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=30)
                     return (blurred.astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
 
-                bg = self._crop_to_fill(clip, w_out, h_out).transform(blur_shadow)
+                # Подложку строим из того же (уже подрезанного) кадра, что и в
+                # центре — иначе «тень» показывала бы куски, которых в центре нет.
+                bg = self._crop_to_fill(src_for_fit, w_out, h_out).transform(blur_shadow)
+                src_audio = clip.audio
                 clip = CompositeVideoClip([bg, fitted.with_position("center")], size=(w_out, h_out))
-                if fitted.audio is not None:
-                    clip = clip.with_audio(fitted.audio)
+                if src_audio is not None:
+                    clip = clip.with_audio(src_audio)
             elif self.split_screen_enabled:
                 # Split-screen: исходник кропается в верхнюю половину экрана, в нижнюю —
                 # случайный фрагмент фоновой "нарезки" (Subway Surfers/песок/т.п.).
