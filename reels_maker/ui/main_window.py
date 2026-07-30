@@ -5,8 +5,8 @@ from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QRadioButton, QSlider, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout,
-    QWidget, QInputDialog,
+    QRadioButton, QScrollArea, QSlider, QSpinBox, QTabWidget, QTextEdit,
+    QVBoxLayout, QWidget, QInputDialog,
 )
 
 from .. import youtube
@@ -137,9 +137,13 @@ class MainWindow(QMainWindow):
             QTabBar::tab{padding:8px 16px;font-weight:bold;}
             QTabWidget::pane{border:1px solid #444;border-radius:4px;}
         """)
-        self.tabs.addTab(self._build_source_tab(), "🎬 Источник")
-        self.tabs.addTab(self._build_ai_format_tab(), "🤖 AI и формат")
-        self.tabs.addTab(self._build_subtitles_tab(), "🔤 Субтитры")
+        self.tabs.addTab(self._scrollable(self._build_source_tab()), "🎬 Источник")
+        self.tabs.addTab(self._scrollable(self._build_ai_format_tab()), "🤖 AI и формат")
+        self.tabs.addTab(self._scrollable(self._build_subtitles_tab()), "🔤 Субтитры")
+        # Ниже вкладок идут три крупные кнопки, прогресс-бар и лог с фиксированным
+        # минимумом — вкладкам достаётся высота по остатку. Без нижней границы её
+        # может не хватить даже на пару групп, и вкладка схлопнется в полоску.
+        self.tabs.setMinimumHeight(320)
         layout.addWidget(self.tabs)
 
         self.start_btn = QPushButton("🎬 Создать клипы с AI обработкой")
@@ -189,6 +193,26 @@ class MainWindow(QMainWindow):
             "font-size:11px;padding:10px;border-radius:5px;}"
         )
         layout.addWidget(self.log_view)
+
+    @staticmethod
+    def _scrollable(tab):
+        """Вкладка в прокрутке.
+
+        QTabWidget не прокручивается: если содержимое выше доступной высоты,
+        Qt дожимает виджеты ниже их minimumSizeHint, и строки начинают
+        наезжать друг на друга. Прокрутка снимает ограничение по высоте —
+        группы всегда получают свой полный размер.
+
+        Горизонтальная полоса отключена намеренно: ширину виджеты получают
+        целиком (setWidgetResizable), а длинные подписи переносятся по словам,
+        поэтому вбок прокручивать нечего.
+        """
+        area = QScrollArea()
+        area.setWidget(tab)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.Shape.NoFrame)  # рамка уже есть у pane вкладок
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return area
 
     def _build_source_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
