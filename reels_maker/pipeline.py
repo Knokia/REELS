@@ -71,7 +71,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from .analysis import MultimodalAnalyzer
 from .config import (BACKGROUND_FOOTAGE_DIR, CLIPS_DIR, FFMPEG_EXE, FONT_SETTINGS,
-                     MODELS_DIR, TRANSCRIPT_CACHE_DIR, WORK_DIR)
+                     MODELS_DIR, TRANSCRIPT_CACHE_DIR, WORK_DIR,
+                     YT_COOKIES_BROWSER, YT_COOKIES_PATH)
 from .emotion import EmotionDetector
 from .face_crop import SmartFaceCrop
 from .hooks import HookOverlay
@@ -701,6 +702,76 @@ class ProcessingThread(QThread):
             self._download_finished = True
             self.log.emit("✅ Скачано!")
 
+    # Признаки того, что yt-dlp упёрся не в сеть и не в битую ссылку, а в
+    # требование залогиненной сессии — только такие ошибки есть смысл повторять
+    # с другим источником кук.
+    _AUTH_ERROR_MARKERS = (
+        "sign in to confirm",
+        "confirm you're not a bot",
+        "confirm you are not a bot",
+        "sign in to view",
+        "login required",
+        "account cookies",
+        "age-restricted",
+    )
+
+    # Отдельно — поломки самого источника кук (нет браузера, профиль занят,
+    # куки зашифрованы). Видео тут ни при чём, просто берём следующий источник.
+    _COOKIE_SOURCE_MARKERS = (
+        "cookie database",   # Chrome: "Could not copy Chrome cookie database"
+        "cookies database",  # Firefox: "could not find firefox cookies database"
+        "unsupported browser",
+        "could not copy",
+        "failed to decrypt",
+        "permission denied",
+        "does not support",
+    )
+
+    @classmethod
+    def _is_youtube_auth_error(cls, message: str) -> bool:
+        low = message.lower()
+        return any(m in low for m in cls._AUTH_ERROR_MARKERS)
+
+    @classmethod
+    def _is_cookie_source_error(cls, message: str) -> bool:
+        low = message.lower()
+        return any(m in low for m in cls._COOKIE_SOURCE_MARKERS)
+
+    def _ytdlp_auth_variants(self):
+        """Источники кук для yt-dlp, от самого надёжного к запасным.
+
+        Готовый cookies.txt идёт первым: он не зависит от того, открыт ли
+        браузер и не поломал ли профиль своё шифрование. Анонимная попытка
+        остаётся в списке последней — на большинстве видео её достаточно,
+        и тратить на неё сессию аккаунта незачем.
+        """
+        if not ('youtube.com' in self.url or 'youtu.be' in self.url):
+            return [("без кук", {})]
+        variants = []
+        if os.path.exists(YT_COOKIES_PATH):
+            variants.append((os.path.basename(YT_COOKIES_PATH),
+                             {'cookiefile': YT_COOKIES_PATH}))
+        browser = YT_COOKIES_BROWSER or 'firefox'
+        variants.append((f"куки из {browser}",
+                         {'cookiesfrombrowser': (browser, None, None, None)}))
+        variants.append(("без кук", {}))
+        return variants
+
+    def _download_attempt(self, opts):
+        """Одна попытка скачивания. При 429 повторяет её без субтитров: лимит
+        чаще всего выедает именно запрос дорожек, а само видео отдаётся."""
+        import yt_dlp
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(self.url, download=True)
+        except Exception as e:
+            if '429' not in str(e) or not opts.get('writesubtitles'):
+                raise
+            self.log.emit("⚠️ 429 Too Many Requests — повтор без субтитров...")
+            retry = {**opts, 'writesubtitles': False, 'writeautomaticsub': False}
+            with yt_dlp.YoutubeDL(retry) as ydl:
+                return ydl.extract_info(self.url, download=True)
+
     def download_youtube(self, tmpdir):
         qmap = {
             "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
@@ -708,7 +779,6 @@ class ProcessingThread(QThread):
             "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]",
             "360p":  "bestvideo[height<=360]+bestaudio/best[height<=360]",
         }
-        import yt_dlp
         opts = {
             'format': qmap.get(self.quality, 'best'),
             'outtmpl': os.path.join(tmpdir, 'video.%(ext)s'),
@@ -718,24 +788,38 @@ class ProcessingThread(QThread):
             'writesubtitles': True, 'writeautomaticsub': True,
             'subtitleslangs': ['ru', 'en'], 'subtitlesformat': 'srt',
         }
-        if 'youtube.com' in self.url or 'youtu.be' in self.url:
-            opts['http_headers'] = {'User-Agent': 'Mozilla/5.0'}
-            # Не форсируем player_client: жёсткий ['web','android'] лишал yt-dlp
-            # доступа к форматам выше 360p (android сейчас режется YouTube SABR-
-            # экспериментом) — стандартный автовыбор клиента у yt-dlp видит 4K.
-        info = None
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-        except Exception as e:
-            if '429' in str(e):
-                self.log.emit("⚠️ 429 Too Many Requests — повтор без субтитров...")
-                opts['writesubtitles'] = opts['writeautomaticsub'] = False
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(self.url, download=True)
-            else:
-                self.log.emit(f"❌ yt-dlp: {e}")
-                raise
+        # Не форсируем player_client: жёсткий ['web','android'] лишал yt-dlp
+        # доступа к форматам выше 360p (android сейчас режется YouTube SABR-
+        # экспериментом) — стандартный автовыбор клиента у yt-dlp видит 4K.
+        # User-Agent тоже не подменяем: yt-dlp выставляет заголовки под тот
+        # клиент, которым представляется, а голый 'Mozilla/5.0' их рассогласует
+        # и делает запрос заметнее для антибота, а не наоборот.
+        info, last_error = None, None
+        for label, extra in self._ytdlp_auth_variants():
+            try:
+                info = self._download_attempt({**opts, **extra})
+                break
+            except Exception as e:
+                last_error = e
+                msg = str(e)
+                # extra непустой только у вариантов с куками — их сбой источника
+                # не повод падать, у анонимного варианта такого сбоя быть не может.
+                if self._is_youtube_auth_error(msg):
+                    self.log.emit(f"⚠️ YouTube требует авторизацию ({label}) — пробую дальше...")
+                elif extra and self._is_cookie_source_error(msg):
+                    self.log.emit(f"⚠️ Не удалось взять {label} — пробую дальше...")
+                else:
+                    self.log.emit(f"❌ yt-dlp: {e}")
+                    raise
+        if info is None:
+            self.log.emit(
+                "❌ YouTube не отдал видео без входа в аккаунт. Что делать:\n"
+                f"   1) экспортировать куки в {YT_COOKIES_PATH} (формат Netscape cookies.txt);\n"
+                "   2) либо залогиниться на youtube.com в Firefox — куки подхватятся сами;\n"
+                "   3) для другого браузера: переменная REELS_COOKIES_BROWSER=chrome|edge|opera\n"
+                "      (на Windows Chrome 127+ шифрует куки, и прочитать их не получится)."
+            )
+            raise last_error
         if info:
             self.video_title = info.get('title', '')
         video_file = None

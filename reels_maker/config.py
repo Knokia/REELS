@@ -36,6 +36,15 @@ TOKEN_PATH           = os.path.join(BASE_DIR, "yt_oauth_creds.json")  # legacy s
 ACCOUNTS_PATH        = os.path.join(BASE_DIR, "yt_accounts.json")     # multi-account store
 QUOTA_PATH            = os.path.join(BASE_DIR, "yt_quota.json")
 
+# Куки для yt-dlp. YouTube всё чаще отдаёт "Sign in to confirm you're not a bot"
+# вместо форматов, и единственный надёжный обход — залогиненная сессия.
+# Порядок: готовый экспорт cookies.txt рядом с настройками, иначе куки прямо из
+# браузера. На Windows Chrome с версии 127 шифрует куки app-bound ключом, который
+# читает только сам Chrome, поэтому по умолчанию берём Firefox — он держит куки
+# в обычном SQLite. Переопределяется через REELS_COOKIES_BROWSER=chrome|edge|...
+YT_COOKIES_PATH    = os.path.join(BASE_DIR, "yt_cookies.txt")
+YT_COOKIES_BROWSER = os.environ.get("REELS_COOKIES_BROWSER", "").strip()
+
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
