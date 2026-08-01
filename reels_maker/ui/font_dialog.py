@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QHBoxLayout, QLabel, QPushButton, QSlider, QSpinBox, QVBoxLayout,
 )
 
-from ..config import FONT_SETTINGS
+from ..config import FONT_SETTING_FIELDS, FONT_SETTINGS, FontSettings
 
 
 class FontSettingsDialog(QDialog):
@@ -190,9 +190,11 @@ class FontSettingsDialog(QDialog):
         self.karaoke_cb.setChecked(FONT_SETTINGS.karaoke_enabled)
 
     def _reset(self):
-        d = FONT_SETTINGS.__class__()
-        for attr in vars(d):
-            setattr(FONT_SETTINGS, attr, getattr(d, attr))
+        # Поля объявлены атрибутами КЛАССА, поэтому __dict__ свежего экземпляра
+        # пуст и прежний обход vars(FontSettings()) не сбрасывал ничего. Берём
+        # дефолты с самого класса по общему списку полей.
+        for attr in FONT_SETTING_FIELDS:
+            setattr(FONT_SETTINGS, attr, getattr(FontSettings, attr))
         self._load_from_settings()
         for btn, key in [
             (self.text_color_btn,   'text_color'),

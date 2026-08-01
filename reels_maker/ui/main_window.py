@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
 
 from .. import youtube
 from ..compilation import CompilationMergeThread
-from ..config import CLIPS_DIR, FONT_SETTINGS, SETTINGS_PATH
+from ..config import (CLIPS_DIR, FONT_SETTING_FIELDS, FONT_SETTINGS, FontSettings,
+                      SETTINGS_PATH)
 from ..pipeline import ProcessingThread
 from ..session_log import SessionLog
 from .font_dialog import FontSettingsDialog
@@ -50,6 +51,39 @@ class MainWindow(QMainWindow):
     def _settings(self):
         return QSettings(SETTINGS_PATH, QSettings.Format.IniFormat)
 
+    # FONT_SETTINGS — синглтон в памяти (config.py), диалог шрифта пишет прямо
+    # в него, поэтому без этих двух методов любая правка субтитров жила только
+    # до закрытия окна. Кладём в тот же settings.ini под префиксом font/.
+
+    def _save_font_settings(self, s):
+        for name in FONT_SETTING_FIELDS:
+            value = getattr(FONT_SETTINGS, name)
+            # Цвета — кортежи (r, g, b); ini хранит только строки, поэтому
+            # раскладываем их сами, а не полагаемся на repr.
+            s.setValue(f"font/{name}",
+                       ",".join(map(str, value)) if isinstance(value, tuple) else value)
+
+    def _load_font_settings(self, s):
+        for name in FONT_SETTING_FIELDS:
+            raw = s.value(f"font/{name}")
+            if raw is None:
+                continue  # поля ещё нет в ini (первый запуск или новое поле)
+            default = getattr(FontSettings, name)
+            try:
+                # bool проверяем раньше int: bool — его подкласс, иначе True
+                # приедет обратно как 1. Из ini всё приходит строкой.
+                if isinstance(default, tuple):
+                    value = tuple(int(part) for part in str(raw).split(","))
+                elif isinstance(default, bool):
+                    value = str(raw).strip().lower() in ("true", "1", "yes")
+                elif isinstance(default, int):
+                    value = int(raw)
+                else:
+                    value = str(raw)
+            except (TypeError, ValueError):
+                continue  # битое значение в ini не должно ронять запуск
+            setattr(FONT_SETTINGS, name, value)
+
     def _save_settings(self):
         s = self._settings()
         s.setValue("quality",       self.quality_combo.currentText())
@@ -75,9 +109,14 @@ class MainWindow(QMainWindow):
         s.setValue("geometry",     self.saveGeometry())
         if 0 <= self.channel_combo.currentIndex() < len(self._accounts):
             s.setValue("channel_id", self._accounts[self.channel_combo.currentIndex()]["channel_id"])
+        self._save_font_settings(s)
 
     def _load_settings(self):
         s = self._settings()
+        # Раньше остальных: превью субтитров собрано в setup_ui() ещё на
+        # дефолтах, и его надо обновить уже загруженными значениями.
+        self._load_font_settings(s)
+        self._refresh_font_preview()
         if s.value("quality"):
             self.quality_combo.setCurrentText(s.value("quality"))
         if s.value("language"):
@@ -521,6 +560,9 @@ class MainWindow(QMainWindow):
     def open_font_dialog(self):
         dlg = FontSettingsDialog(self)
         if dlg.exec():
+            # Пишем сразу по «Применить», а не только в closeEvent: иначе
+            # аварийное завершение приложения теряет только что настроенное.
+            self._save_font_settings(self._settings())
             self._refresh_font_preview()
             self._log(
                 f"✅ Шрифт: {FONT_SETTINGS.font_family} {FONT_SETTINGS.font_size}px"

@@ -72,4 +72,12 @@ class FontSettings:
     karaoke_color: tuple  = (255, 220, 50)
 
 
+# Имена полей FontSettings одним списком: по нему UI сохраняет настройки в
+# settings.ini и сбрасывает их к дефолтам. Берём из самого класса, чтобы новое
+# поле не пришлось дописывать ещё в двух местах. vars() у экземпляра для этого
+# не годится — поля объявлены на классе, и у свежего экземпляра __dict__ пуст.
+FONT_SETTING_FIELDS = tuple(
+    name for name in vars(FontSettings) if not name.startswith("_")
+)
+
 FONT_SETTINGS = FontSettings()
