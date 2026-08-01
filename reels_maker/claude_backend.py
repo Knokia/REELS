@@ -82,17 +82,30 @@ class ClaudeBackend:
         m = _CHATML_RE.match(prompt)
         user_content = m.group(1) if m else prompt
 
-        stop_sequences = [s for s in (stop or []) if s not in _LOCAL_ONLY_STOPS]
+        # Пробельные стоп-последовательности API отклоняет с 400 "each stop
+        # sequence must contain non-whitespace", а pipeline.py передаёт "\n" —
+        # так локальная модель обрывает заголовок/хук на первой строке.
+        # Выбрасываем их вместе с ChatML-токенами: ограничение одной строкой
+        # при этом не теряется, generate_clip_title/generate_hook и так берут
+        # у ответа .split('\n')[0].
+        stop_sequences = [s for s in (stop or [])
+                          if s not in _LOCAL_ONLY_STOPS and s.strip()]
 
         kwargs = dict(
             model=self.model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=[{"role": "user", "content": user_content}],
         )
         if stop_sequences:
             kwargs["stop_sequences"] = stop_sequences
-        if top_p and top_p < 1.0:
+        # llama-cpp принимает temperature и top_p вместе, Claude — только один
+        # из двух ("`temperature` and `top_p` cannot both be specified for this
+        # model"), а pipeline.py шлёт оба сразу (generate_clip_title: 0.95 и
+        # 0.92, generate_hook: 0.9 и 0.95). Оставляем temperature — именно ей
+        # pipeline задаёт разброс заголовков и хуков, top_p там вспомогательный.
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        elif top_p is not None and top_p < 1.0:
             kwargs["top_p"] = top_p
 
         last_err = None
@@ -103,6 +116,15 @@ class ClaudeBackend:
                 break
             except Exception as e:
                 last_err = e
+                # 4xx (кроме 429) — дефект самого запроса, а не временный сбой:
+                # повтор вернёт ту же ошибку. Раньше такой 400 честно троился,
+                # и настоящая причина пряталась под тремя одинаковыми
+                # предупреждениями. Ретраим только то, что бывает временным:
+                # 429, 5xx, таймауты и обрывы связи (у них status_code нет).
+                status = getattr(e, "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    self.log_cb(f"❌ Claude API отклонил запрос: {e}")
+                    raise
                 self.log_cb(f"⚠️ Claude API: попытка {attempt + 1}/3 не удалась ({e})")
                 if attempt < 2:
                     time.sleep(2 ** attempt)
