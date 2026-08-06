@@ -33,6 +33,19 @@ _CHATML_RE = re.compile(
 # бессмысленно (но и не вредно; фильтруем просто для чистоты).
 _LOCAL_ONLY_STOPS = {"<|im_end|>", "<|endoftext|>"}
 
+# Модели, у которых sampling-параметры убраны из API: temperature/top_p/top_k
+# возвращают 400 "`temperature` is deprecated for this model". Это поколение
+# Opus 4.7 и Sonnet 5 и новее; на Haiku 4.5 и более ранних они работают как
+# раньше. Сверяем по префиксу, чтобы датированные варианты ID тоже попадали.
+_NO_SAMPLING_PARAMS = (
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+    "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+)
+
+
+def _accepts_sampling(model: str) -> bool:
+    return not model.startswith(_NO_SAMPLING_PARAMS)
+
 
 class ClaudeBackend:
     """Копит суммарную стоимость прогона в self.total_cost_usd — pipeline.py
@@ -103,10 +116,11 @@ class ClaudeBackend:
         # model"), а pipeline.py шлёт оба сразу (generate_clip_title: 0.95 и
         # 0.92, generate_hook: 0.9 и 0.95). Оставляем temperature — именно ей
         # pipeline задаёт разброс заголовков и хуков, top_p там вспомогательный.
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        elif top_p is not None and top_p < 1.0:
-            kwargs["top_p"] = top_p
+        if _accepts_sampling(self.model):
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            elif top_p is not None and top_p < 1.0:
+                kwargs["top_p"] = top_p
 
         last_err = None
         resp = None
