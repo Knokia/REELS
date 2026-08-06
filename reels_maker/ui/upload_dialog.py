@@ -13,6 +13,11 @@ CATEGORIES = {
     "22": "Блоги", "23": "Юмор", "24": "Развлечения", "27": "Образование", "28": "Наука"
 }
 
+# Категория, с которой стартуют все клипы. Раньше её никто не задавал, и список
+# вставал на первый пункт словаря — «Фильмы», что для коротких нарезок неверно
+# и уезжало в YouTube молча.
+DEFAULT_CATEGORY = "24"  # Развлечения
+
 COL_FILE, COL_TITLE, COL_DUR, COL_VIRAL, COL_UPLOAD, COL_SCHEDULE, \
     COL_DATE, COL_TIME, COL_PRIVACY, COL_CATEGORY, COL_PLAYLIST, \
     COL_THUMB, COL_DESC, COL_PREVIEW = range(14)
@@ -47,9 +52,20 @@ class UploadScheduleDialog(QDialog):
             row = QHBoxLayout(); row.addWidget(QLabel(lbl))
             edit = QLineEdit(default); setattr(self, attr, edit)
             row.addWidget(edit); layout.addLayout(row)
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("📂 Категория:"))
+        self.global_category = QComboBox()
+        for vid, label in CATEGORIES.items():
+            self.global_category.addItem(label, vid)
+        self.global_category.setCurrentIndex(self.global_category.findData(DEFAULT_CATEGORY))
+        self.global_category.currentIndexChanged.connect(self._apply_category_to_all)
+        cat_row.addWidget(self.global_category); cat_row.addStretch()
+        layout.addLayout(cat_row)
+
         desc_hint = QLabel(
-            "Описание по умолчанию используется для всех клипов — "
-            "у каждого можно задать своё через кнопку «📝» в таблице."
+            "Описание и категория применяются ко всем клипам сразу — "
+            "у каждого можно задать своё: описание через кнопку «📝», "
+            "категорию — в её колонке таблицы."
         )
         desc_hint.setStyleSheet("color:#888;font-size:10px;padding:0 0 4px 2px;")
         layout.addWidget(desc_hint)
@@ -79,6 +95,8 @@ class UploadScheduleDialog(QDialog):
         self._playlists = self._safe_list_playlists()
         for idx, clip in enumerate(self.clips):
             self._add_row(idx, clip)
+        # Строки созданы — только теперь есть куда разложить стартовую категорию.
+        self._apply_category_to_all()
         layout.addWidget(self.table)
 
         br3 = QHBoxLayout(); br3.addStretch()
@@ -125,6 +143,23 @@ class UploadScheduleDialog(QDialog):
             return youtube.list_playlists(self.credentials)
         except Exception:
             return []
+
+    def _apply_category_to_all(self):
+        """Раскладывает глобальную категорию по всем строкам таблицы.
+
+        Выпадающий список в строке при этом остаётся рабочим: после смены
+        общего значения категорию отдельного клипа можно переопределить — так
+        же, как описание. В API уходит именно значение из строки
+        (см. currentData на COL_CATEGORY в _start_upload).
+        """
+        vid = self.global_category.currentData()
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, COL_CATEGORY)
+            if combo is None:
+                continue
+            index = combo.findData(vid)
+            if index >= 0:
+                combo.setCurrentIndex(index)
 
     def _add_row(self, idx, clip):
         self.table.insertRow(idx)
